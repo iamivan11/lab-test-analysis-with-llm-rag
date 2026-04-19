@@ -1,5 +1,5 @@
+from PySide6.QtCore import QRegularExpression, Qt
 from PySide6.QtGui import QIntValidator, QRegularExpressionValidator
-from PySide6.QtCore import Qt, QRegularExpression
 from PySide6.QtWidgets import (
     QButtonGroup,
     QDialog,
@@ -37,12 +37,10 @@ class ProfileDialog(QDialog):
         # Name — letters, spaces, hyphens only
         self._name = QLineEdit(profile.get("name", ""))
         self._name.setPlaceholderText("e.g. John")
-        self._name.setValidator(
-            QRegularExpressionValidator(QRegularExpression(r"[A-Za-z\s\-']+"))
-        )
+        self._name.setValidator(QRegularExpressionValidator(QRegularExpression(r"[A-Za-z\s\-']+")))
         form.addRow("Name", self._name)
 
-        # Age — integer 1–120
+        # Age -- integer 1-120
         self._age = QLineEdit(profile.get("age", ""))
         self._age.setPlaceholderText("e.g. 30")
         self._age.setValidator(QIntValidator(1, 120))
@@ -101,32 +99,41 @@ class ProfileDialog(QDialog):
         self._other.setFixedHeight(80)
         form.addRow("Other", self._other)
 
-        # Buttons — spanning row inside the form so right edge aligns with fields
+        # Enter on any line edit acts as Save
+        for field in (self._name, self._age, self._weight, self._height):
+            field.returnPressed.connect(self._save)
+
+        # Buttons — placed in the field column so width matches "Other" field
         btn_widget = QWidget()
         btn_row = QHBoxLayout(btn_widget)
         btn_row.setContentsMargins(0, 0, 0, 0)
         btn_row.setSpacing(8)
-        btn_row.addStretch()
 
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("attachButton")
-        cancel_btn.setFixedWidth(100)
+        cancel_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         cancel_btn.clicked.connect(self.reject)
         btn_row.addWidget(cancel_btn)
 
         save_btn = QPushButton("Save")
-        save_btn.setFixedWidth(100)
+        save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         save_btn.clicked.connect(self._save)
         btn_row.addWidget(save_btn)
 
-        form.addRow(btn_widget)  # spans both columns → Save right-edge = field right-edge
+        form.addRow("", btn_widget)  # field column only → width matches Other
         layout.addLayout(form)
 
     def _save(self):
         profile = {
             "name": self._name.text().strip(),
             "age": self._age.text().strip(),
-            "gender": "Male" if self._male_btn.isChecked() else "Female" if self._female_btn.isChecked() else "",
+            "gender": (
+                "Male"
+                if self._male_btn.isChecked()
+                else "Female"
+                if self._female_btn.isChecked()
+                else ""
+            ),
             "weight": self._weight.text().strip(),
             "height": self._height.text().strip(),
             "other": self._other.toPlainText().strip(),

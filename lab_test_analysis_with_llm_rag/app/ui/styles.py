@@ -50,21 +50,6 @@ QPushButton#attachButton:hover {
     background-color: #45475a;
 }
 
-QPushButton#reasoningButton {
-    background-color: #313244;
-    color: #6c7086;
-    padding: 8px 12px;
-}
-
-QPushButton#reasoningButton:hover {
-    background-color: #45475a;
-}
-
-QPushButton#reasoningButton:checked {
-    background-color: #313244;
-    color: #a6e3a1;
-    border: 1px solid #a6e3a1;
-}
 
 QLabel {
     color: #cdd6f4;
