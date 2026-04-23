@@ -32,3 +32,12 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: [tomli]
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: uv run pytest
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

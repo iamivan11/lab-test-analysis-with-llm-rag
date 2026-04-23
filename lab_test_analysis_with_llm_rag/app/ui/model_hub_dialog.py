@@ -200,9 +200,10 @@ class ModelHubDialog(QDialog):
         self._progress_label.setMinimumWidth(100)
         progress_layout.addWidget(self._progress_label)
 
-        self._cancel_btn = QPushButton("Cancel")
-        self._cancel_btn.setObjectName("attachButton")
-        self._cancel_btn.setFixedSize(100, 38)
+        self._cancel_btn = QPushButton("\u2715")
+        self._cancel_btn.setObjectName("iconSecondary")
+        self._cancel_btn.setFixedSize(28, 28)
+        self._cancel_btn.setToolTip("Cancel")
         self._cancel_btn.clicked.connect(self._cancel_download)
         progress_layout.addWidget(self._cancel_btn)
 
@@ -285,7 +286,8 @@ class ModelHubDialog(QDialog):
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._files_table.setItem(row, 1, size_item)
 
-            dl_btn = QPushButton("\u25bc")
+            dl_btn = QPushButton("\u2193")
+            dl_btn.setObjectName("iconPrimary")
             dl_btn.setFixedSize(28, 28)
             dl_btn.setToolTip("Download")
             dl_btn.clicked.connect(lambda checked, name=f["name"]: self._start_download(name))
@@ -306,6 +308,7 @@ class ModelHubDialog(QDialog):
         self._progress_widget.setVisible(True)
         self._progress_bar.setValue(0)
         self._progress_label.setText("0%")
+        self._cancel_btn.setEnabled(True)
 
         self._download_worker = DownloadWorker(self._selected_model_id, filename)
         self._download_worker.progress.connect(self._on_download_progress)
@@ -328,9 +331,8 @@ class ModelHubDialog(QDialog):
         self._status.setText(f"Download error: {error}")
 
     def _cancel_download(self):
-        if self._download_worker:
+        if self._download_worker and self._download_worker.isRunning():
+            log("HUB", "User cancelled download")
+            self._cancel_btn.setEnabled(False)
+            self._status.setText("Cancelling download...")
             self._download_worker.stop()
-
-    def closeEvent(self, event):
-        self._cancel_download()
-        super().closeEvent(event)

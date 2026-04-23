@@ -23,7 +23,13 @@ from PySide6.QtWidgets import (
     QWidgetAction,
 )
 
-from app.config import APP_NAME, load_model_path, load_profile, save_model_path
+from app.config import (
+    APP_NAME,
+    load_model_meta,
+    load_model_path,
+    load_profile,
+    save_model_path,
+)
 from app.core.chat_store import (
     delete_chat,
     list_chats,
@@ -201,7 +207,7 @@ class ServerStartWorker(QThread):
             n_ctx = load_ctx_size() or meta.context_length
             start_server(self.model_path, n_ctx=n_ctx, on_progress=self.progress.emit)
             log("WORKER", "ServerStartWorker: finished successfully")
-            self.finished.emit(meta.name or Path(self.model_path).name)
+            self.finished.emit(meta.name or Path(self.model_path).stem)
         except Exception as e:
             log("WORKER", f"ServerStartWorker: ERROR {e}")
             self.error_occurred.emit(str(e))
@@ -349,6 +355,9 @@ class MainWindow(QMainWindow):
         self._pending_prompt = ""
         self._compression_attempted = False
         self._generation_stopped = False
+        self._docs_dialog: DocumentsHubDialog | None = None
+        self._hub_dialog: ModelHubDialog | None = None
+        self._parsing_active = False
 
         self._build_ui()
         self._init_chat()
@@ -437,7 +446,7 @@ class MainWindow(QMainWindow):
         top_row.addWidget(self._hub_btn)
 
         self._model_btn = QPushButton("Load Model")
-        self._model_btn.setObjectName("attachButton")
+        self._model_btn.setObjectName("loadModelButton")
         self._model_btn.setStyleSheet("font-size: 13px;")
         self._model_btn.clicked.connect(self._select_model)
         top_row.addWidget(self._model_btn)
@@ -783,32 +792,48 @@ class MainWindow(QMainWindow):
         self._status_label.setText(
             "Failed to download default model — click 'Load Model' to select manually"
         )
-        self._model_btn.setEnabled(True)
+        self._model_btn.setEnabled(not self._parsing_active)
 
     def _select_model(self):
         from app.ui.model_select_dialog import ModelSelectDialog
 
         dlg = ModelSelectDialog(parent=self)
+        dlg.loaded_model_deleted.connect(self._ensure_default_model)
         if dlg.exec() and dlg.selected_path:
             save_model_path(dlg.selected_path)
             self._load_model(dlg.selected_path)
 
     def _open_model_hub(self):
-        dlg = ModelHubDialog(self)
-        dlg.model_downloaded.connect(self._on_hub_model_downloaded)
-        dlg.exec()
+        if self._hub_dialog is None:
+            self._hub_dialog = ModelHubDialog(self)
+        self._hub_dialog.show()
+        self._hub_dialog.raise_()
+        self._hub_dialog.activateWindow()
 
     def _open_documents_hub(self):
-        dlg = DocumentsHubDialog(self)
-        dlg.exec()
+        if self._docs_dialog is None:
+            self._docs_dialog = DocumentsHubDialog(self)
+            self._docs_dialog.model_swapped.connect(self._on_docs_model_swapped)
+            self._docs_dialog.parsing_active_changed.connect(self._on_parsing_active_changed)
+        self._docs_dialog.show()
+        self._docs_dialog.raise_()
+        self._docs_dialog.activateWindow()
 
-    def _on_hub_model_downloaded(self, path: str):
-        save_model_path(path)
-        self._load_model(path)
+    def _on_docs_model_swapped(self, model_path: str, display_name: str):
+        log("UI", f"Documents Hub swapped model to {display_name} ({model_path})")
+        self._model_name = display_name
+        self._status_label.setText(f"Model: {display_name}")
+
+    def _on_parsing_active_changed(self, active: bool):
+        log("UI", f"Parsing active changed: {active}")
+        self._parsing_active = active
+        self._model_btn.setEnabled(not active)
 
     def _load_model(self, model_path: str):
         log("UI", f"_load_model: {model_path}")
-        self._status_label.setText(f"Loading model: {Path(model_path).name}...")
+        cached = load_model_meta(model_path) or {}
+        display = cached.get("name") or Path(model_path).stem
+        self._status_label.setText(f"Loading model: {display}...")
         self._model_btn.setEnabled(False)
         self._send_btn.setEnabled(False)
 
@@ -820,19 +845,21 @@ class MainWindow(QMainWindow):
         self._server_worker.start()
 
     def _on_model_meta(self, meta) -> None:
-        log("UI", f"Model meta: ctx={meta.context_length}")
+        log("UI", f"Model meta: name={meta.name!r}, ctx={meta.context_length}")
+        if meta.name:
+            self._status_label.setText(f"Loading model: {meta.name}...")
 
     def _on_server_started(self, model_name: str):
         log("UI", f"Server started, model: {model_name}")
         self._model_name = model_name
         self._status_label.setText(f"Model: {model_name}")
-        self._model_btn.setEnabled(True)
+        self._model_btn.setEnabled(not self._parsing_active)
         self._send_btn.setEnabled(True)
 
     def _on_server_error(self, error: str):
         log("UI", f"Server error: {error}")
-        self._status_label.setText(f"Model load error: {error}")
-        self._model_btn.setEnabled(True)
+        self._status_label.setText("Model load error: not supported")
+        self._model_btn.setEnabled(not self._parsing_active)
 
     # ── Messaging ──────────────────────────────────────────────────────────
 
@@ -843,7 +870,6 @@ class MainWindow(QMainWindow):
         log("UI", f"_send_message: '{prompt[:80]}...'")
 
         self._input_field.clear()
-        self._send_btn.setEnabled(False)
 
         self._reset_format()
         if self._history:
@@ -857,10 +883,37 @@ class MainWindow(QMainWindow):
             self._current_chat["title"] = title_from_first_message(prompt)
             self._refresh_chat_list()
 
+        if self._parsing_active:
+            self._reply_chat_disabled()
+            return
+
+        self._send_btn.setEnabled(False)
         self._compression_attempted = False
 
         context = self._build_profile_context()
         self._launch_llm_worker(context)
+
+    def _reply_chat_disabled(self):
+        """Render a canned assistant message while document parsing is in progress."""
+        msg = (
+            "Chat is disabled while documents are being parsed. "
+            "Please wait for parsing to finish before sending new messages."
+        )
+        self._reset_format()
+        self._chat_display.append("<p>&nbsp;</p>")
+        label = f"Assistant ({self._model_name})" if self._model_name else "Assistant"
+        self._chat_display.append(f"<b style='color: #a6e3a1;'>{label}</b>")
+        self._chat_display.append(f"<i style='color: #f38ba8;'>{msg}</i>")
+        self._history.append(
+            {
+                "role": "assistant",
+                "content": msg,
+                "model": self._model_name,
+                "error": True,
+            }
+        )
+        self._save_current_chat()
+        self._refresh_chat_list()
 
     def _launch_llm_worker(self, context: str = ""):
         from app.config import load_max_tokens

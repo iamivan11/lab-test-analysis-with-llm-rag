@@ -1,4 +1,34 @@
+# ruff: noqa: RUF001
 STYLESHEET = """
+/* ──────────────────────────────────────────────────────────────────────
+   Button system
+   ──────────────────────────────────────────────────────────────────────
+   Shape × Variant.
+
+   Shape (determines size):
+     Named  — 38 tall, width ≥ 100 (or 120 for long labels)
+     Icon   — 28 × 28 square
+
+   Variant (determines color):
+     Primary    — blue filled       (main / confirm)
+     Secondary  — dark neutral      (dismiss / navigation / alternative)
+     Icon Secondary is a special case: red symbol on dark background
+     (destructive / cancel) — follows the Stop-generation color pattern.
+
+   objectName mapping:
+     Named Primary    — (default, no objectName)          — e.g. Upload, Send, Save
+     Named Secondary  — "secondaryButton" (alias: "attachButton")
+                                                          — e.g. Close, Cancel, New Chat
+     Icon Primary     — "iconPrimary"                     — e.g. Download  (↓)
+     Icon Secondary   — "iconSecondary" (red, destructive) — e.g. Cancel (✕), Delete row (−)
+
+   Specialty (unique behavior, outside the shape × variant grid):
+     "stopButton"      — Stop generation (red-when-enabled)
+     "chatMenuButton"  — Hover-only ⋯ in chat list items
+     "genderButton"    — Toggle for profile gender selection
+     "fileChip"        — Removable file attachment pill
+   ────────────────────────────────────────────────────────────────────── */
+
 QMainWindow {
     background-color: #1e1e2e;
 }
@@ -40,14 +70,82 @@ QPushButton:disabled {
     color: #6c7086;
 }
 
-QPushButton#attachButton {
+/* Named Secondary */
+QPushButton#attachButton,
+QPushButton#secondaryButton {
     background-color: #313244;
     color: #cdd6f4;
     padding: 8px 12px;
 }
 
-QPushButton#attachButton:hover {
+QPushButton#attachButton:hover,
+QPushButton#secondaryButton:hover {
     background-color: #45475a;
+}
+
+/* Load Model — Named Secondary with a disabled state */
+QPushButton#loadModelButton {
+    background-color: #313244;
+    color: #cdd6f4;
+    padding: 8px 12px;
+}
+
+QPushButton#loadModelButton:hover {
+    background-color: #45475a;
+}
+
+QPushButton#loadModelButton:disabled {
+    background-color: #45475a;
+    color: #6c7086;
+}
+
+/* Icon Primary — 28×28 blue */
+QPushButton#iconPrimary {
+    background-color: #89b4fa;
+    color: #1e1e2e;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 0;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QPushButton#iconPrimary:hover {
+    background-color: #b4d0fb;
+}
+
+QPushButton#iconPrimary:pressed {
+    background-color: #74c7ec;
+}
+
+QPushButton#iconPrimary:disabled {
+    background-color: #45475a;
+    color: #6c7086;
+}
+
+/* Icon Secondary — 28×28 dark background, red symbol (destructive) */
+QPushButton#iconSecondary {
+    background-color: #313244;
+    color: #45475a;
+    border: 1px solid #45475a;
+    border-radius: 8px;
+    padding: 0;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QPushButton#iconSecondary:enabled {
+    color: #f38ba8;
+}
+
+QPushButton#iconSecondary:enabled:hover {
+    background-color: #45475a;
+    border-color: #f38ba8;
+}
+
+QPushButton#iconSecondary:disabled {
+    background-color: #45475a;
+    color: #6c7086;
 }
 
 

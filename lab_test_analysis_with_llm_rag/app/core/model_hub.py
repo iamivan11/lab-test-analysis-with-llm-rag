@@ -5,6 +5,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from app.config import (
@@ -21,7 +22,13 @@ HF_BASE = "https://huggingface.co"
 
 
 def search_models(query: str, limit: int = 20) -> list[dict]:
-    """Search HuggingFace for GGUF models, sorted by downloads."""
+    """Search HuggingFace for models that actually contain GGUF files.
+
+    The HF `filter=gguf` tag is loose — some tagged repos hold only
+    safetensors. We post-filter by listing each repo's tree in parallel and
+    dropping any that has zero `.gguf` files, so non-runnable repos never
+    reach the UI.
+    """
     params = urllib.parse.urlencode(
         {
             "search": query,
@@ -35,7 +42,7 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
     with urllib.request.urlopen(url, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
-    return [
+    candidates = [
         {
             "id": m.get("id", ""),
             "author": m.get("author", ""),
@@ -45,6 +52,20 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
         }
         for m in data
     ]
+
+    def _has_gguf(model_id: str) -> bool:
+        try:
+            return bool(list_gguf_files(model_id))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log("HUB", f"Dropping {model_id} (tree fetch failed: {e})")
+            return False
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        flags = list(pool.map(_has_gguf, [c["id"] for c in candidates]))
+
+    filtered = [c for c, ok in zip(candidates, flags, strict=True) if ok]
+    log("HUB", f"search_models: {len(candidates)} candidates -> {len(filtered)} with GGUF files")
+    return filtered
 
 
 def list_gguf_files(model_id: str) -> list[dict]:
@@ -78,6 +99,9 @@ def download_model(
     Returns:
         Path to the downloaded file.
     """
+    if not filename.lower().endswith(".gguf"):
+        raise ValueError(f"Only .gguf files can be downloaded, got: {filename}")
+
     url = f"{HF_BASE}/{model_id}/resolve/main/{urllib.parse.quote(filename)}"
     dest = MODELS_DIR / filename
     tmp = dest.with_suffix(".gguf.part")

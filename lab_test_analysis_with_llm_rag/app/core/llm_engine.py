@@ -6,13 +6,15 @@ from pathlib import Path
 
 import httpx
 
-from app.config import DEFAULT_MMPROJ_LOCAL, DEFAULT_MODEL_FILE, MODELS_DIR
+from app.config import DEFAULT_MMPROJ_LOCAL, DEFAULT_MODEL_FILE, MODELS_DIR, load_ctx_size
 from app.core.logger import log
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8765
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
-SERVER_BINARY = Path(__file__).resolve().parent.parent.parent.parent / "bin" / "llama-server"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+SERVER_BINARY = PROJECT_ROOT / "bin" / "llama-server"
+RAG_DEBUG_DIR = PROJECT_ROOT / "tmp" / "rag-chunks"
 
 SYSTEM_PROMPT = """\
 You are a clinical lab test analyst assistant. You help patients understand their \
@@ -23,13 +25,13 @@ historical data is provided below, use it directly — do not claim you lack acc
 
 SCOPE: You ONLY answer questions related to health, medicine, lab tests, \
 medical conditions, and biology. If the user asks about anything outside \
-this scope, reply: "I can only help with health, medical, and biology \
+this scope, reply: "I can only help with health and medical \
 related questions."
 
 RESPONSE RULES (follow strictly):
 - Be concise and direct. Answer the question asked — no filler, no preamble.
 - Do NOT second-guess or re-analyze your previous responses. Treat your earlier \
-answers as correct and build on them. Focus only on the new question.
+answers as correct and build on them only if they are relevant. Focus only on the new question.
 - Professional clinical tone. No emojis, no exclamation marks, no casual language.
 - Never use LaTeX notation ($, \\text, \\times, etc.). Write math as plain text.
 - Use markdown tables when comparing values across dates. Every row MUST start \
@@ -58,6 +60,14 @@ _PROGRESS_MAP = [
 ]
 
 _server_process: subprocess.Popen | None = None
+_current_model_path: str | None = None
+
+
+def get_current_model_path() -> str | None:
+    """Path of the model currently served by llama-server, or None if not running."""
+    if _server_process is None or _server_process.poll() is not None:
+        return None
+    return _current_model_path
 
 
 def _kill_port() -> None:
@@ -79,7 +89,7 @@ def start_server(
     n_ctx: int = 32768,
     on_progress: Callable[[str], None] | None = None,
 ) -> None:
-    global _server_process
+    global _server_process, _current_model_path
     log("SERVER", f"start_server called, model={model_path}, n_ctx={n_ctx}")
 
     from app.core.llama_setup import ensure_server
@@ -121,6 +131,7 @@ def start_server(
     log("SERVER", f"Process started, pid={_server_process.pid}")
 
     _wait_for_ready(on_progress=on_progress)
+    _current_model_path = model_path
     log("SERVER", "Server is ready")
 
 
@@ -169,7 +180,7 @@ def _parse_progress(line: str) -> str | None:
 
 
 def stop_server() -> None:
-    global _server_process
+    global _server_process, _current_model_path
     status = "alive" if _server_process and _server_process.poll() is None else "none"
     log("SERVER", f"stop_server called, process={status}")
     if _server_process and _server_process.poll() is None:
@@ -179,6 +190,7 @@ def stop_server() -> None:
         except subprocess.TimeoutExpired:
             _server_process.kill()
     _server_process = None
+    _current_model_path = None
 
 
 def is_server_running() -> bool:
@@ -215,11 +227,46 @@ def summarize_history(history: list[dict]) -> str:
     return response.json()["choices"][0]["message"]["content"]
 
 
-def _retrieve_rag_context(history: list[dict]) -> str:
-    """Retrieve relevant chunks from the knowledge base for the current query."""
+def _dump_chunks_for_debug(query: str, chunks: list[dict]) -> None:
+    """Write retrieved chunks as .md files to tmp/rag-chunks/ for inspection."""
+    try:
+        if RAG_DEBUG_DIR.exists():
+            for old in RAG_DEBUG_DIR.iterdir():
+                if old.is_file():
+                    old.unlink()
+        RAG_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+        width = max(2, len(str(len(chunks))))
+        for i, chunk in enumerate(chunks, start=1):
+            path = RAG_DEBUG_DIR / f"chunk_{i:0{width}d}.md"
+            path.write_text(
+                f"# Query\n\n{query}\n\n"
+                f"# Source\n\n{chunk['source']}\n\n"
+                f"# Chunk\n\n{chunk['text']}\n"
+            )
+    except OSError as e:
+        log("RAG", f"Failed to dump chunks: {e}")
+
+
+def rag_char_budget(ctx_size: int) -> int:
+    """Character budget for RAG chunks: ~33% of context window at ~3 chars/token."""
+    return int(ctx_size * 3 * 0.33)
+
+
+def _retrieve_rag_context(history: list[dict]) -> tuple[str, bool]:
+    """Retrieve relevant chunks for the last user message.
+
+    Returns (context_text, has_indexed_docs). When no documents are indexed,
+    returns ("", False) so the caller can inform the model rather than silently
+    running without RAG.
+    """
     log("RAG", "Retrieving context from knowledge base...")
     try:
-        from app.core.knowledge_base import retrieve
+        from app.core.knowledge_base import list_indexed_documents, retrieve
+
+        if not list_indexed_documents():
+            log("RAG", "No documents indexed; skipping retrieval")
+            return "", False
 
         # Use the last user message as the retrieval query
         query = ""
@@ -229,22 +276,22 @@ def _retrieve_rag_context(history: list[dict]) -> str:
                 break
         if not query:
             log("RAG", "No user message found in history, skipping")
-            return ""
+            return "", True
 
         log("RAG", f"Query: {query[:100]}...")
-        results = retrieve(query, top_k=10)
+        results = retrieve(query, top_k=20)
         log("RAG", f"Retrieved {len(results)} chunks")
         if not results:
-            return ""
+            return "", True
 
-        # Format chunks, capping total size to avoid overflowing context window.
-        # ~4000 chars ≈ 1000 tokens, leaving room for system prompt + history + response.
-        MAX_CONTEXT_CHARS = 4000
+        _dump_chunks_for_debug(query, results)
+
+        max_chars = rag_char_budget(load_ctx_size() or 8192)
         sections = []
         total_chars = 0
         for chunk in results:
             entry = f"[Source: {chunk['source']}]\n{chunk['text']}"
-            if total_chars + len(entry) > MAX_CONTEXT_CHARS and sections:
+            if total_chars + len(entry) > max_chars and sections:
                 break
             sections.append(entry)
             total_chars += len(entry) + 7  # account for "\n\n---\n\n" separator
@@ -252,10 +299,10 @@ def _retrieve_rag_context(history: list[dict]) -> str:
         context = "\n\n---\n\n".join(sections)
         used = f"{len(sections)}/{len(results)}"
         log("RAG", f"Context length: {len(context)} chars ({used} chunks used)")
-        return context
+        return context, True
     except Exception as e:
         log("RAG", f"Error during retrieval: {e}")
-        return ""
+        return "", True
 
 
 def generate_stream(
@@ -280,13 +327,20 @@ def generate_stream(
     # Build system prompt with RAG context baked in
     system_content = SYSTEM_PROMPT
 
-    rag_context = _retrieve_rag_context(history)
+    rag_context, has_docs = _retrieve_rag_context(history)
     if rag_context:
         system_content += (
             "\n\n--- PATIENT'S HISTORICAL LAB DATA ---\n"
             "Below is relevant data retrieved from the patient's previous lab test records. "
             "Use this data to answer the user's questions, compare values, and identify trends.\n\n"
             + rag_context
+        )
+    elif not has_docs:
+        system_content += (
+            "\n\n--- KNOWLEDGE BASE STATUS ---\n"
+            "The user has not uploaded any lab test documents yet. If their question "
+            "requires historical lab data, tell them to upload documents via the "
+            "Documents window in the app, then retry the question."
         )
 
     if context:

@@ -11,6 +11,8 @@ dependencies = [
     "sentence-transformers>=3.0",
     "gguf>=0.10",
     "psutil>=5.9",
+    "Pillow>=10.0",
+    "pypdfium2>=5.0",
 ]
 
 [project.scripts]
@@ -26,8 +28,14 @@ where = ["lab_test_analysis_with_llm_rag"]
 [dependency-groups]
 dev = [
     "pre-commit>=4.5",
+    "pytest>=8.0",
     "ruff>=0.14",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["lab_test_analysis_with_llm_rag"]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.ruff]
 line-length = 100

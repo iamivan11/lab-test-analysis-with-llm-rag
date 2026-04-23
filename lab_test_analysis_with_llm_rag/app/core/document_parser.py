@@ -24,6 +24,8 @@ _EXTRACTION_PROMPT = (
     "Do not add commentary or interpretation — only extract what is written."
 )
 
+_MAX_OUTPUT_TOKENS = 8192
+
 # Hidden folder for reviewing raw parsing results (set externally if needed)
 _SAVE_DIR: Path | None = None
 
@@ -78,12 +80,28 @@ def _extract_single_page(
     ]
     response = httpx.post(
         f"{server_url}/v1/chat/completions",
-        json={"model": "local", "messages": messages, "stream": False},
+        json={
+            "model": "local",
+            "messages": messages,
+            "stream": False,
+            "max_tokens": _MAX_OUTPUT_TOKENS,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
         timeout=600,
     )
     response.raise_for_status()
-    text = response.json()["choices"][0]["message"]["content"]
-    log("PARSER", f"Page {page_index + 1}: {len(text)} chars extracted")
+    message = response.json()["choices"][0]["message"]
+    text = message.get("content") or ""
+    if not text.strip():
+        reasoning = message.get("reasoning_content") or ""
+        log(
+            "PARSER",
+            f"Page {page_index + 1}: empty content "
+            f"(reasoning_content={len(reasoning)} chars) — "
+            f"model returned nothing usable",
+        )
+    else:
+        log("PARSER", f"Page {page_index + 1}: {len(text)} chars extracted")
     return (page_index, text.strip())
 
 

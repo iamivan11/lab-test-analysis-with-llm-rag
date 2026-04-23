@@ -8,6 +8,7 @@ Three-phase pipeline per category:
 
 import json
 import re
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -119,16 +120,22 @@ def organize_documents(
     source_dir: Path,
     master_dir: Path,
     on_progress: Callable[[str], None] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> int:
     """Classify and synthesize lab documents into master category files.
 
-    Returns the number of master files created.
+    Returns the number of master files created. If `stop_event` is set
+    between steps, the pipeline exits early; any master files already
+    written are left in place.
     """
 
     def emit(msg: str) -> None:
         log("ORGANIZER", msg)
         if on_progress:
             on_progress(msg)
+
+    def cancelled() -> bool:
+        return stop_event is not None and stop_event.is_set()
 
     md_files = sorted(source_dir.glob("*.md"))
     if not md_files:
@@ -137,6 +144,10 @@ def organize_documents(
     emit(f"Found {len(md_files)} documents to compile")
 
     contents: dict[str, str] = {f.name: f.read_text(encoding="utf-8") for f in md_files}
+
+    if cancelled():
+        emit("Cancelled before classification")
+        return 0
 
     # ── Phase 1: Classify ────────────────────────────────────────────────
     emit("Classifying documents...")
@@ -208,6 +219,9 @@ def organize_documents(
     total = len(categories)
 
     for i, (category, filenames) in enumerate(categories.items(), 1):
+        if cancelled():
+            emit(f"Cancelled after {created} master files")
+            return created
         emit(f"[{i}/{total}] Synthesizing '{category}'...")
 
         parts = [
@@ -269,6 +283,10 @@ def organize_documents(
             emit(f"[{i}/{total}] WARNING: synthesis returned empty for '{category}', skipping")
             continue
 
+        if cancelled():
+            emit(f"Cancelled after {created} master files")
+            return created
+
         # ── Phase 3: Refine ──────────────────────────────────────────────
         emit(f"[{i}/{total}] Refining '{category}'...")
 
@@ -328,9 +346,16 @@ def organize_documents(
     # Maps target_slug -> list of markdown snippets to merge in
     orphans: dict[str, list[str]] = {slug: [] for slug in category_names}
 
+    if cancelled():
+        emit(f"Cancelled before reconciliation — {created} master files")
+        return created
+
     emit("Reconciling cross-category data...")
 
     for slug, path in master_files.items():
+        if cancelled():
+            emit(f"Cancelled during reconciliation — {created} master files")
+            return created
         current_text = path.read_text(encoding="utf-8")
         others = [c for c in category_names if c != slug]
         if not others:
@@ -419,6 +444,9 @@ def organize_documents(
 
     # Merge orphaned content into target master files
     for slug, snippets in orphans.items():
+        if cancelled():
+            emit(f"Cancelled during orphan merge — {created} master files")
+            return created
         if not snippets:
             continue
         path = master_files.get(slug)
