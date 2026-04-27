@@ -1,0 +1,369 @@
+"""Dialog for managing uploaded lab test documents."""
+
+import shutil
+from pathlib import Path
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from config import DOCS_DIR, format_size, save_model_path
+from core.document_parser import SUPPORTED_EXTENSIONS
+from core.knowledge_base import remove_document
+from core.logger import log
+from ui.documents.workers import (
+    FILTERING_OUTPUT_DIR,
+    PARSING_OUTPUT_DIR,
+    EnsureVisionModelWorker,
+    IndexWorker,
+)
+from ui.styles import STYLESHEET
+
+
+class DocumentsHubDialog(QDialog):
+    model_swapped = Signal(str, str)
+    parsing_active_changed = Signal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Documents")
+        self.setMinimumSize(600, 400)
+        self.setStyleSheet(STYLESHEET)
+        self._index_worker = None
+        self._ensure_worker = None
+        self._pending_files: list[Path] = []
+        self._current_batch: list[Path] = []
+        self._cancelled = False
+        self._reindex_active = False
+        self._build_ui()
+        self._refresh_list()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        header_row = QHBoxLayout()
+
+        header_row.addStretch()
+
+        self._upload_btn = QPushButton("Upload")
+        self._upload_btn.setFixedSize(100, 38)
+        self._upload_btn.clicked.connect(self._upload_files)
+        header_row.addWidget(self._upload_btn)
+
+        self._reindex_btn = QPushButton("Reindex")
+        self._reindex_btn.setObjectName("attachButton")
+        self._reindex_btn.setFixedSize(100, 38)
+        self._reindex_btn.setEnabled(False)
+        self._reindex_btn.clicked.connect(self._reindex_files)
+        header_row.addWidget(self._reindex_btn)
+
+        self._delete_all_btn = QPushButton("Delete All")
+        self._delete_all_btn.setObjectName("attachButton")
+        self._delete_all_btn.setFixedSize(100, 38)
+        self._delete_all_btn.setEnabled(False)
+        self._delete_all_btn.clicked.connect(self._delete_all)
+        header_row.addWidget(self._delete_all_btn)
+
+        layout.addLayout(header_row)
+
+        self._status = QLabel("")
+        self._status.setObjectName("statusLabel")
+        layout.addWidget(self._status)
+
+        self._progress_widget = QWidget()
+        progress_row = QHBoxLayout(self._progress_widget)
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(8)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFormat("%v / %m files")
+        progress_row.addWidget(self._progress_bar, stretch=1)
+
+        self._cancel_btn = QPushButton("\u2715")
+        self._cancel_btn.setObjectName("iconSecondary")
+        self._cancel_btn.setFixedSize(28, 28)
+        self._cancel_btn.setToolTip("Cancel")
+        self._cancel_btn.clicked.connect(self._cancel_current)
+        progress_row.addWidget(self._cancel_btn)
+
+        self._progress_widget.setVisible(False)
+        layout.addWidget(self._progress_widget)
+
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(["Document", "Size", ""])
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.verticalHeader().setVisible(False)
+        header = self._table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self._table, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("attachButton")
+        close_btn.setFixedSize(100, 38)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _refresh_list(self):
+        self._refresh_source_list()
+
+    def _refresh_source_list(self):
+        files = sorted(
+            [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")],
+            key=lambda f: f.name.lower(),
+        )
+        self._populate_table(files, deletable=True)
+        self._status.setText(f"{len(files)} document(s)")
+        self._reindex_btn.setEnabled(len(files) > 0)
+        self._delete_all_btn.setEnabled(len(files) > 0)
+
+    def _populate_table(self, files: list[Path], deletable: bool):
+        self._table.setRowCount(len(files))
+        for row, file_path in enumerate(files):
+            name_item = QTableWidgetItem(file_path.name)
+            self._table.setItem(row, 0, name_item)
+
+            size_item = QTableWidgetItem(format_size(file_path.stat().st_size))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row, 1, size_item)
+
+            if deletable:
+                del_btn = QPushButton("\u2212")
+                del_btn.setObjectName("iconSecondary")
+                del_btn.setFixedSize(28, 28)
+                del_btn.setToolTip("Delete")
+                del_btn.clicked.connect(lambda checked, path=file_path: self._delete_file(path))
+                self._table.setCellWidget(row, 2, del_btn)
+            else:
+                self._table.setCellWidget(row, 2, None)
+
+    def _upload_files(self):
+        log("DOCS", "Opening upload file dialog")
+        ext_filter = " ".join(f"*{ext}" for ext in sorted(SUPPORTED_EXTENSIONS))
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Lab Test Documents",
+            "",
+            f"Supported Files ({ext_filter});;All Files (*)",
+        )
+        if not file_paths:
+            return
+
+        new_files = []
+        for src_path in file_paths:
+            src = Path(src_path)
+            dest = DOCS_DIR / src.name
+            if dest.exists():
+                continue
+            shutil.copy2(src, dest)
+            new_files.append(dest)
+
+        if new_files:
+            log("DOCS", f"Uploaded {len(new_files)} new files: {[f.name for f in new_files]}")
+            self._start_indexing(new_files)
+
+    def _start_indexing(self, file_paths: list[Path]):
+        if self._index_worker and self._index_worker.isRunning():
+            self._status.setText("Indexing already in progress...")
+            return
+        if self._ensure_worker and self._ensure_worker.isRunning():
+            self._status.setText("Vision model is still loading...")
+            return
+
+        self._cancelled = False
+        self._reindex_active = False
+        self._current_batch = list(file_paths)
+        self._upload_btn.setEnabled(False)
+        self._delete_all_btn.setEnabled(False)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setMaximum(len(file_paths))
+        self._cancel_btn.setEnabled(True)
+        self._cancel_btn.setVisible(True)
+        self._progress_widget.setVisible(True)
+        self._pending_files = file_paths
+        self._status.setText("Preparing vision model...")
+        self.parsing_active_changed.emit(True)
+
+        self._ensure_worker = EnsureVisionModelWorker()
+        self._ensure_worker.progress.connect(self._on_index_progress)
+        self._ensure_worker.finished.connect(self._on_vision_model_ready)
+        self._ensure_worker.error_occurred.connect(self._on_index_error)
+        self._ensure_worker.start()
+
+    def _start_reindexing(self, file_paths: list[Path]):
+        if self._index_worker and self._index_worker.isRunning():
+            self._status.setText("Indexing already in progress...")
+            return
+        if self._ensure_worker and self._ensure_worker.isRunning():
+            self._status.setText("Vision model is still loading...")
+            return
+
+        self._cancelled = False
+        self._reindex_active = True
+        self._current_batch = []
+        self._upload_btn.setEnabled(False)
+        self._reindex_btn.setEnabled(False)
+        self._delete_all_btn.setEnabled(False)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setMaximum(len(file_paths))
+        self._cancel_btn.setEnabled(True)
+        self._cancel_btn.setVisible(True)
+        self._progress_widget.setVisible(True)
+        self._status.setText("Reindexing from saved filtered results...")
+        self.parsing_active_changed.emit(True)
+
+        self._index_worker = IndexWorker(file_paths, reuse_filtered=True)
+        self._index_worker.progress.connect(self._on_index_progress)
+        self._index_worker.file_progress.connect(self._on_file_progress)
+        self._index_worker.finished.connect(self._on_index_done)
+        self._index_worker.failed_files.connect(self._on_files_failed)
+        self._index_worker.error_occurred.connect(self._on_index_error)
+        self._index_worker.start()
+
+    def _reindex_files(self):
+        files = sorted(
+            [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")],
+            key=lambda f: f.name.lower(),
+        )
+        if not files:
+            self._status.setText("No documents to reindex")
+            return
+
+        missing = [f.name for f in files if not (FILTERING_OUTPUT_DIR / f"{f.stem}.md").exists()]
+        if missing:
+            self._status.setText(f"Missing filtered results for {len(missing)} document(s)")
+            return
+
+        self._start_reindexing(files)
+
+    def _cancel_current(self):
+        if self._cancelled:
+            return
+        log("DOCS", "User cancelled parsing")
+        self._cancelled = True
+        self._cancel_btn.setEnabled(False)
+        self._status.setText("Cancelling — waiting for current page to finish...")
+        if self._ensure_worker and self._ensure_worker.isRunning():
+            self._ensure_worker.stop()
+        if self._index_worker and self._index_worker.isRunning():
+            self._index_worker.stop()
+
+    def _cleanup_batch(self):
+        for path in self._current_batch:
+            remove_document(path.name)
+            path.unlink(missing_ok=True)
+            raw_md_path = PARSING_OUTPUT_DIR / f"{path.stem}.md"
+            filtered_md_path = FILTERING_OUTPUT_DIR / f"{path.stem}.md"
+            raw_md_path.unlink(missing_ok=True)
+            filtered_md_path.unlink(missing_ok=True)
+            log("DOCS", f"Cleaned up cancelled file: {path.name}")
+        self._current_batch = []
+
+    def _finalize_parsing(self, status_text: str):
+        self._progress_widget.setVisible(False)
+        self._upload_btn.setEnabled(True)
+        self._reindex_btn.setEnabled(True)
+        self._delete_all_btn.setEnabled(True)
+        self._reindex_active = False
+        self._status.setText(status_text)
+        self._refresh_list()
+        self.parsing_active_changed.emit(False)
+
+    def _on_vision_model_ready(self, model_path: str, display_name: str):
+        if model_path and Path(model_path).exists():
+            save_model_path(model_path)
+            self.model_swapped.emit(model_path, display_name)
+
+        file_paths = self._pending_files
+        self._pending_files = []
+
+        if self._cancelled:
+            self._cleanup_batch()
+            self._finalize_parsing("Parsing cancelled")
+            return
+
+        if not file_paths:
+            self._finalize_parsing("")
+            return
+
+        self._index_worker = IndexWorker(file_paths)
+        self._index_worker.progress.connect(self._on_index_progress)
+        self._index_worker.file_progress.connect(self._on_file_progress)
+        self._index_worker.finished.connect(self._on_index_done)
+        self._index_worker.failed_files.connect(self._on_files_failed)
+        self._index_worker.error_occurred.connect(self._on_index_error)
+        self._index_worker.start()
+
+    def _on_index_progress(self, msg: str):
+        self._status.setText(msg)
+
+    def _on_file_progress(self, done: int, total: int):
+        self._progress_bar.setValue(done)
+
+    def _on_files_failed(self, failed: list[Path]):
+        if self._reindex_active:
+            self._refresh_list()
+            self._status.setText(f"Reindex failed for {len(failed)} document(s)")
+            return
+        for path in failed:
+            remove_document(path.name)
+            path.unlink(missing_ok=True)
+            log("DOCS", f"Removed failed file: {path.name}")
+        self._refresh_list()
+
+    def _on_index_done(self, total_chunks: int, cancelled: bool):
+        log("DOCS", f"Indexing complete: {total_chunks} chunks stored, cancelled={cancelled}")
+        if cancelled:
+            self._cleanup_batch()
+            self._finalize_parsing("Parsing cancelled — all files dropped")
+        else:
+            self._current_batch = []
+            self._finalize_parsing(f"Indexing complete — {total_chunks} chunks stored")
+
+    def _on_index_error(self, error: str):
+        log("DOCS", f"Indexing error: {error}")
+        if self._cancelled:
+            self._cleanup_batch()
+            self._finalize_parsing("Parsing cancelled")
+        else:
+            self._current_batch = []
+            self._finalize_parsing(f"Error: {error}")
+
+    def _delete_file(self, path: Path):
+        log("DOCS", f"Deleting document: {path.name}")
+        remove_document(path.name)
+        path.unlink(missing_ok=True)
+        self._status.setText(f"Deleted: {path.name}")
+        self._refresh_list()
+
+    def _delete_all(self):
+        log("DOCS", "Deleting all documents")
+        files = [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")]
+        for file_path in files:
+            remove_document(file_path.name)
+            file_path.unlink(missing_ok=True)
+        self._status.setText(f"Deleted {len(files)} document(s)")
+        self._refresh_list()
+
+
+__all__ = ["DocumentsHubDialog"]

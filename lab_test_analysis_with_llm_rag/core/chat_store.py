@@ -3,8 +3,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.config import DATA_DIR
-from app.core.logger import log
+from config import DATA_DIR
+from core.logger import log
 
 CHATS_DIR = DATA_DIR / "chats"
 CHATS_DIR.mkdir(parents=True, exist_ok=True)

@@ -17,14 +17,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import format_size
-from app.core.logger import log
-from app.core.model_hub import (
+from config import format_size
+from core.logger import log
+from core.model_hub import (
     download_model,
     list_gguf_files,
     search_models,
 )
-from app.ui.styles import STYLESHEET
+from ui.styles import STYLESHEET
 
 
 class SearchWorker(QThread):

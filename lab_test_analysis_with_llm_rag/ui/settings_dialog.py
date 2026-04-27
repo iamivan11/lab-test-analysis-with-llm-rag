@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.config import (
+from config import (
     load_ctx_size,
     load_max_tokens,
     load_model_meta,
@@ -18,7 +18,7 @@ from app.config import (
     save_ctx_size,
     save_max_tokens,
 )
-from app.ui.styles import STYLESHEET
+from ui.styles import STYLESHEET
 
 _CTX_OPTIONS = [2048, 4096, 8192, 16384]
 _MAX_TOKENS_OPTIONS = [1024, 2048, 4096, 8192]

@@ -5,7 +5,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.core.logger import log
+from core.logger import log
 
 # ── Fast name-only reader (no mmap, no numpy) ──────────────────────────
 

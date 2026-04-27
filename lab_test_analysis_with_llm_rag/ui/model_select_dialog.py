@@ -14,11 +14,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from app.config import DEFAULT_MODEL_FILE, MODELS_DIR, format_size, load_model_meta
-from app.core.llm_engine import get_current_model_path
-from app.core.logger import log
-from app.core.model_meta import _clean_name, read_model_name
-from app.ui.styles import STYLESHEET
+from config import DEFAULT_MODEL_FILE, MODELS_DIR, format_size, load_model_meta
+from core.llm_engine import get_current_model_path
+from core.logger import log
+from core.model_meta import _clean_name, read_model_name
+from ui.styles import STYLESHEET
 
 
 def _is_main_model(path: Path) -> bool:

@@ -8,15 +8,16 @@ dependencies = [
     "httpx>=0.27",
     "markdown>=3.6",
     "chromadb>=1.0",
-    "sentence-transformers>=3.0",
+    "sentence-transformers>=5.4",
     "gguf>=0.10",
+    "pydantic>=2.0",
     "psutil>=5.9",
     "Pillow>=10.0",
     "pypdfium2>=5.0",
 ]
 
 [project.scripts]
-lab-analyzer = "app.main:main"
+lab-analyzer = "main:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -29,6 +30,7 @@ where = ["lab_test_analysis_with_llm_rag"]
 dev = [
     "pre-commit>=4.5",
     "pytest>=8.0",
+    "pytest-qt>=4.4",
     "ruff>=0.14",
 ]
 
@@ -55,3 +57,6 @@ select = [
     "RUF",    # Ruff-specific rules
 ]
 pycodestyle = { max-doc-length = 105 }
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "core", "ui", "main"]

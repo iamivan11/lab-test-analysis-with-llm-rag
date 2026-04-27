@@ -13,8 +13,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import load_profile, save_profile
-from app.ui.styles import STYLESHEET
+from config import load_profile, save_profile
+from ui.styles import STYLESHEET
 
 
 class ProfileDialog(QDialog):

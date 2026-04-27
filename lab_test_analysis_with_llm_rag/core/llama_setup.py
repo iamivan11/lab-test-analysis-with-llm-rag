@@ -11,9 +11,9 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from app.core.logger import log
+from core.logger import log
 
-BIN_DIR = Path(__file__).resolve().parent.parent.parent.parent / "bin"
+BIN_DIR = Path(__file__).resolve().parents[2] / "bin"
 SERVER_BINARY = BIN_DIR / "llama-server"
 REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 
@@ -26,6 +26,19 @@ REQUIRED_DYLIBS = [
     "libllama.0.dylib",
     "libmtmd.0.dylib",
 ]
+
+REQUIRED_BUILD_TOOLS = ["git", "cmake", "install_name_tool", "otool"]
+
+
+def _check_build_tools() -> None:
+    """Fail fast if required build tools are not on PATH."""
+    missing = [tool for tool in REQUIRED_BUILD_TOOLS if shutil.which(tool) is None]
+    if missing:
+        raise RuntimeError(
+            "Cannot build llama-server — missing required tools: "
+            f"{', '.join(missing)}. Install Xcode Command Line Tools "
+            "(`xcode-select --install`) and CMake (`brew install cmake`), then retry."
+        )
 
 
 def is_server_ready() -> bool:
@@ -60,6 +73,8 @@ def build_and_install(
     def progress(msg: str) -> None:
         if on_progress:
             on_progress(msg)
+
+    _check_build_tools()
 
     build_dir = Path(tempfile.mkdtemp(prefix="llama-build-"))
 

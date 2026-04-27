@@ -57,11 +57,11 @@ QPushButton {
     font-weight: bold;
 }
 
-QPushButton:hover {
+QPushButton:enabled:hover {
     background-color: #b4d0fb;
 }
 
-QPushButton:pressed {
+QPushButton:enabled:pressed {
     background-color: #74c7ec;
 }
 
@@ -70,39 +70,28 @@ QPushButton:disabled {
     color: #6c7086;
 }
 
-/* Named Secondary */
+/* Named Secondary / Load Model */
 QPushButton#attachButton,
-QPushButton#secondaryButton {
-    background-color: #313244;
-    color: #cdd6f4;
-    padding: 8px 12px;
-}
-
-QPushButton#attachButton:hover,
-QPushButton#secondaryButton:hover {
-    background-color: #45475a;
-}
-
-/* Load Model — Named Secondary with a disabled state */
+QPushButton#secondaryButton,
 QPushButton#loadModelButton {
-    background-color: #313244;
-    color: #cdd6f4;
     padding: 8px 12px;
 }
 
-QPushButton#loadModelButton:hover {
-    background-color: #45475a;
+QPushButton#attachButton:enabled,
+QPushButton#secondaryButton:enabled,
+QPushButton#loadModelButton:enabled {
+    background-color: #313244;
+    color: #cdd6f4;
 }
 
-QPushButton#loadModelButton:disabled {
+QPushButton#attachButton:enabled:hover,
+QPushButton#secondaryButton:enabled:hover,
+QPushButton#loadModelButton:enabled:hover {
     background-color: #45475a;
-    color: #6c7086;
 }
 
 /* Icon Primary — 28×28 blue */
 QPushButton#iconPrimary {
-    background-color: #89b4fa;
-    color: #1e1e2e;
     border: 1px solid #45475a;
     border-radius: 8px;
     padding: 0;
@@ -110,23 +99,21 @@ QPushButton#iconPrimary {
     font-weight: bold;
 }
 
-QPushButton#iconPrimary:hover {
+QPushButton#iconPrimary:enabled {
+    background-color: #89b4fa;
+    color: #1e1e2e;
+}
+
+QPushButton#iconPrimary:enabled:hover {
     background-color: #b4d0fb;
 }
 
-QPushButton#iconPrimary:pressed {
+QPushButton#iconPrimary:enabled:pressed {
     background-color: #74c7ec;
-}
-
-QPushButton#iconPrimary:disabled {
-    background-color: #45475a;
-    color: #6c7086;
 }
 
 /* Icon Secondary — 28×28 dark background, red symbol (destructive) */
 QPushButton#iconSecondary {
-    background-color: #313244;
-    color: #45475a;
     border: 1px solid #45475a;
     border-radius: 8px;
     padding: 0;
@@ -135,17 +122,13 @@ QPushButton#iconSecondary {
 }
 
 QPushButton#iconSecondary:enabled {
+    background-color: #313244;
     color: #f38ba8;
 }
 
 QPushButton#iconSecondary:enabled:hover {
     background-color: #45475a;
     border-color: #f38ba8;
-}
-
-QPushButton#iconSecondary:disabled {
-    background-color: #45475a;
-    color: #6c7086;
 }
 
 
@@ -168,12 +151,11 @@ QLabel#fileLabel {
 }
 
 QPushButton#stopButton {
-    background-color: #313244;
-    color: #45475a;
     padding: 8px;
 }
 
 QPushButton#stopButton:enabled {
+    background-color: #313244;
     color: #f38ba8;
 }
 
@@ -183,8 +165,6 @@ QPushButton#stopButton:enabled:hover {
 }
 
 QPushButton#fileChip {
-    background-color: #313244;
-    color: #a6e3a1;
     border: 1px solid #45475a;
     border-radius: 8px;
     padding: 3px 10px;
@@ -192,15 +172,18 @@ QPushButton#fileChip {
     font-weight: normal;
 }
 
-QPushButton#fileChip:hover {
+QPushButton#fileChip:enabled {
+    background-color: #313244;
+    color: #a6e3a1;
+}
+
+QPushButton#fileChip:enabled:hover {
     background-color: #45475a;
     border-color: #f38ba8;
     color: #f38ba8;
 }
 
 QPushButton#genderButton {
-    background-color: #313244;
-    color: #6c7086;
     border: 1px solid #45475a;
     border-radius: 8px;
     padding: 8px 16px;
@@ -208,11 +191,16 @@ QPushButton#genderButton {
     font-weight: normal;
 }
 
-QPushButton#genderButton:hover {
+QPushButton#genderButton:enabled {
+    background-color: #313244;
+    color: #6c7086;
+}
+
+QPushButton#genderButton:enabled:hover {
     background-color: #45475a;
 }
 
-QPushButton#genderButton:checked {
+QPushButton#genderButton:enabled:checked {
     color: #cdd6f4;
     border: 1px solid #89b4fa;
 }
@@ -279,8 +267,6 @@ QLabel#chatItemLabel {
 }
 
 QPushButton#chatMenuButton {
-    background-color: transparent;
-    color: #6c7086;
     border: none;
     border-radius: 4px;
     padding: 0px;
@@ -288,7 +274,12 @@ QPushButton#chatMenuButton {
     font-weight: bold;
 }
 
-QPushButton#chatMenuButton:hover {
+QPushButton#chatMenuButton:enabled {
+    background-color: transparent;
+    color: #6c7086;
+}
+
+QPushButton#chatMenuButton:enabled:hover {
     color: #cdd6f4;
     background-color: rgba(69, 71, 90, 150);
 }

@@ -1,13 +1,10 @@
 import sys
-from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
-from app.core.logger import enable_file_logging, log
-from app.ui.main_window import MainWindow
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-APP_LOG_FILE = PROJECT_ROOT / "tmp" / "app.log"
+from config import APP_LOG_FILE
+from core.logger import enable_file_logging, log
+from ui.main_window import MainWindow
 
 
 def main():

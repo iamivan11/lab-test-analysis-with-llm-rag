@@ -8,14 +8,14 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from app.config import (
+from config import (
     DEFAULT_MMPROJ_FILE,
     DEFAULT_MMPROJ_LOCAL,
     DEFAULT_MODEL_FILE,
     DEFAULT_MODEL_REPO,
     MODELS_DIR,
 )
-from app.core.logger import log
+from core.logger import log
 
 HF_API = "https://huggingface.co/api"
 HF_BASE = "https://huggingface.co"

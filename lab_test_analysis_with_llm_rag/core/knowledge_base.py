@@ -13,14 +13,24 @@ from pathlib import Path
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from app.config import DATA_DIR, DOCS_DIR
-from app.core.logger import log
+from config import (
+    DATA_DIR,
+    DOCS_DIR,
+    EMBEDDER_CONFIGS,
+    KB_CHUNK_OVERLAP,
+    KB_CHUNK_SIZE,
+    KB_COLLECTION_NAME,
+    KB_EMBEDDING_MODEL,
+    KB_TOP_K,
+)
+from core.logger import log
 
 CHROMA_DIR = DATA_DIR / "chromadb"
-COLLECTION_NAME = "lab_documents"
-EMBEDDING_MODEL = "BAAI/bge-m3"
-CHUNK_SIZE = 500
-TOP_K = 10
+COLLECTION_NAME = KB_COLLECTION_NAME
+EMBEDDING_MODEL = KB_EMBEDDING_MODEL
+CHUNK_SIZE = KB_CHUNK_SIZE
+CHUNK_OVERLAP = KB_CHUNK_OVERLAP
+TOP_K = KB_TOP_K
 
 _embedder: SentenceTransformer | None = None
 _client: chromadb.ClientAPI | None = None
@@ -31,12 +41,30 @@ _client_lock = threading.Lock()
 # ── Models ─────────────────────────────────────────────────────────────
 
 
+def _sentence_transformer_kwargs(model_name: str) -> dict:
+    config = EMBEDDER_CONFIGS.get(model_name, {})
+    return {"device": "cpu", **config.get("loader_kwargs", {})}
+
+
+def _document_encode_kwargs(model_name: str) -> dict:
+    config = EMBEDDER_CONFIGS.get(model_name, {})
+    return dict(config.get("document_encode_kwargs", {}))
+
+
+def _query_encode_kwargs(model_name: str) -> dict:
+    config = EMBEDDER_CONFIGS.get(model_name, {})
+    return dict(config.get("query_encode_kwargs", {}))
+
+
 def _get_embedder() -> SentenceTransformer:
     global _embedder
     with _embedder_lock:
         if _embedder is None:
             log("KB", f"Loading embedding model {EMBEDDING_MODEL}...")
-            _embedder = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
+            _embedder = SentenceTransformer(
+                EMBEDDING_MODEL,
+                **_sentence_transformer_kwargs(EMBEDDING_MODEL),
+            )
             log("KB", "Embedding model loaded")
         return _embedder
 
@@ -61,8 +89,16 @@ def _split_text(text: str, max_size: int = CHUNK_SIZE) -> list[str]:
         return [text]
 
     pieces = []
-    remaining = text
-    while len(remaining) > max_size:
+    start = 0
+    text_length = len(text)
+    while start < text_length:
+        remaining = text[start:]
+        if len(remaining) <= max_size:
+            piece = remaining.strip()
+            if piece:
+                pieces.append(piece)
+            break
+
         cut = remaining.rfind(". ", 0, max_size)
         if cut > max_size // 3:
             cut += 1
@@ -70,27 +106,34 @@ def _split_text(text: str, max_size: int = CHUNK_SIZE) -> list[str]:
             cut = remaining.rfind("\n", 0, max_size)
         if cut <= max_size // 3:
             cut = max_size
-        pieces.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-    if remaining:
-        pieces.append(remaining)
+
+        end = start + cut
+        piece = text[start:end].strip()
+        if piece:
+            pieces.append(piece)
+
+        next_start = max(end - CHUNK_OVERLAP, start + 1)
+        start = next_start
     return pieces
 
 
-def chunk_document(text: str, source: str) -> list[dict]:
+def chunk_document(
+    text: str,
+    source: str,
+    report_date: str,
+    report_type: str,
+) -> list[dict]:
     """Split a document into ~500-char chunks with metadata."""
-    doc_date = _extract_date_from_text(text)
-    if not doc_date:
-        doc_date = _extract_date_from_filename(source)
-
     chunks = []
-    for piece in _split_text(text, CHUNK_SIZE):
+    for chunk_index, piece in enumerate(_split_text(text, CHUNK_SIZE)):
         if piece.strip():
             chunks.append(
                 {
-                    "text": f"[{source}, {doc_date}]\n{piece}",
+                    "text": piece,
                     "source": source,
-                    "date": doc_date,
+                    "report_date": report_date,
+                    "report_type": report_type,
+                    "chunk_index": chunk_index,
                 }
             )
     return chunks
@@ -133,6 +176,8 @@ def _extract_date_from_filename(filename: str) -> str:
 def index_document(
     filename: str,
     markdown_text: str,
+    report_date: str,
+    report_type: str,
     on_progress=None,
 ) -> int:
     """Chunk, embed, and store a document. Returns chunk count."""
@@ -140,7 +185,12 @@ def index_document(
     if on_progress:
         on_progress(f"Chunking {filename}...")
 
-    chunks = chunk_document(markdown_text, source=filename)
+    chunks = chunk_document(
+        markdown_text,
+        source=filename,
+        report_date=report_date,
+        report_type=report_type,
+    )
     if not chunks:
         return 0
 
@@ -148,17 +198,22 @@ def index_document(
     metadatas = [
         {
             "source": c["source"],
-            "date": c["date"],
-            "chunk_index": i,
+            "report_date": c["report_date"],
+            "report_type": c["report_type"],
+            "chunk_index": c["chunk_index"],
         }
-        for i, c in enumerate(chunks)
+        for c in chunks
     ]
 
     if on_progress:
         on_progress(f"Embedding {len(chunks)} chunks...")
 
     model = _get_embedder()
-    embeddings = model.encode(texts, show_progress_bar=False).tolist()
+    embeddings = model.encode(
+        texts,
+        show_progress_bar=False,
+        **_document_encode_kwargs(EMBEDDING_MODEL),
+    ).tolist()
 
     if on_progress:
         on_progress(f"Storing {len(chunks)} chunks...")
@@ -212,7 +267,11 @@ def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
         return []
 
     model = _get_embedder()
-    query_embedding = model.encode([query], show_progress_bar=False).tolist()
+    query_embedding = model.encode(
+        [query],
+        show_progress_bar=False,
+        **_query_encode_kwargs(EMBEDDING_MODEL),
+    ).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=min(top_k, count),
@@ -225,6 +284,9 @@ def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
                 {
                     "text": text,
                     "source": results["metadatas"][0][i]["source"],
+                    "report_date": results["metadatas"][0][i].get("report_date", ""),
+                    "report_type": results["metadatas"][0][i].get("report_type", ""),
+                    "chunk_index": results["metadatas"][0][i].get("chunk_index", 0),
                     "score": 1 - results["distances"][0][i],
                 }
             )
@@ -243,8 +305,25 @@ def list_indexed_documents() -> list[str]:
     collection = _get_collection()
     if collection.count() == 0:
         return []
-    all_meta = collection.get(include=[])["metadatas"]
+    all_meta = collection.get(include=["metadatas"])["metadatas"]
     return sorted(set(m["source"] for m in all_meta))
+
+
+def prune_orphaned_indexed_documents() -> list[str]:
+    """Remove indexed sources that no longer exist in DOCS_DIR."""
+    indexed = set(list_indexed_documents())
+    existing = {
+        f.name for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")
+    }
+    orphaned = sorted(indexed - existing)
+    if not orphaned:
+        return []
+
+    collection = _get_collection()
+    for filename in orphaned:
+        _remove_by_source(collection, filename)
+        log("KB", f"Pruned orphaned indexed source: {filename}")
+    return orphaned
 
 
 def get_unindexed_documents() -> list[Path]:
