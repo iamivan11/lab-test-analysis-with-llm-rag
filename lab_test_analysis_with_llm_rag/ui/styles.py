@@ -47,6 +47,52 @@ QTextEdit:focus, QLineEdit:focus {
     border: 1px solid #89b4fa;
 }
 
+QLabel#profileSectionLabel {
+    color: #89b4fa;
+    font-size: 15px;
+    font-weight: bold;
+    padding: 0px;
+}
+
+QScrollArea#profileScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#profileScrollArea > QWidget,
+QWidget#profileScrollContent {
+    background: transparent;
+}
+
+QScrollArea#profileScrollArea QScrollBar:vertical {
+    background: transparent;
+    border: none;
+    width: 8px;
+    margin: 0px;
+}
+
+QScrollArea#profileScrollArea QScrollBar::handle:vertical {
+    background: #45475a;
+    border-radius: 4px;
+    min-height: 32px;
+}
+
+QScrollArea#profileScrollArea QScrollBar::handle:vertical:hover {
+    background: #585b70;
+}
+
+QScrollArea#profileScrollArea QScrollBar::add-line:vertical,
+QScrollArea#profileScrollArea QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#profileScrollArea QScrollBar::add-page:vertical,
+QScrollArea#profileScrollArea QScrollBar::sub-page:vertical {
+    background: transparent;
+}
+
 QPushButton {
     background-color: #89b4fa;
     color: #1e1e2e;
@@ -214,12 +260,60 @@ QWidget#sidebar {
     border-right: 1px solid #313244;
 }
 
+QPushButton#sidebarTile {
+    border: 1px solid #313244;
+    border-radius: 12px;
+    padding: 0px;
+    font-weight: bold;
+}
+
+QPushButton#sidebarTile:enabled {
+    background-color: #1e1e2e;
+    color: #cdd6f4;
+}
+
+QPushButton#sidebarTile:enabled:hover {
+    background-color: #313244;
+}
+
+QPushButton#sidebarTile:enabled:checked {
+    background-color: #313244;
+    border: 1px solid #89b4fa;
+}
+
 QListWidget {
     background-color: transparent;
     border: none;
     color: #cdd6f4;
     font-size: 13px;
     outline: none;
+}
+
+/* Slim, themed scrollbar for the chat list. Visibility is controlled in
+   Python (auto-hide after a brief idle window) — these rules only style
+   it when visible. */
+QListWidget#chatList QScrollBar:vertical {
+    background: transparent;
+    border: none;
+    width: 8px;
+    margin: 0px;
+}
+QListWidget#chatList QScrollBar::handle:vertical {
+    background: #45475a;
+    border-radius: 4px;
+    min-height: 24px;
+}
+QListWidget#chatList QScrollBar::handle:vertical:hover {
+    background: #585b70;
+}
+QListWidget#chatList QScrollBar::add-line:vertical,
+QListWidget#chatList QScrollBar::sub-line:vertical {
+    height: 0px;
+    background: transparent;
+}
+QListWidget#chatList QScrollBar::add-page:vertical,
+QListWidget#chatList QScrollBar::sub-page:vertical {
+    background: transparent;
 }
 
 QListWidget::item {

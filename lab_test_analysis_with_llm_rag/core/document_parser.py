@@ -77,7 +77,7 @@ _METADATA_PROMPT = (
     "Extract document metadata from this parsed medical document.\n\n"
     "Return strict JSON with exactly these fields:\n"
     '- "report_date": document/report date in DD/MM/YYYY format, or "" if unknown\n'
-    '- "report_type": concise report type like "blood test", "semen analysis", '
+    '- "report_type": concise report type like "blood test", "urine test", '
     '"ultrasound", or "" if unknown\n\n'
     "Rules:\n"
     "- Return JSON only. No prose. No markdown.\n"
