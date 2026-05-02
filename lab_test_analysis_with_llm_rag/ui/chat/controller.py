@@ -43,6 +43,7 @@ class ChatController:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, chat["id"])
             item.setData(Qt.ItemDataRole.DisplayRole, "")
+            item.setData(Qt.ItemDataRole.UserRole + 1, chat["title"])
             item.setSizeHint(QSize(0, 42))
             self.window._chat_list.addItem(item)
             widget = ChatItemWidget(chat["id"], chat["title"])
@@ -52,6 +53,9 @@ class ChatController:
             if chat["id"] == self.window._current_chat["id"]:
                 self.window._chat_list.setCurrentItem(item)
         self.window._chat_list.blockSignals(False)
+        # Newly populated items must respect the active search filter.
+        if hasattr(self.window, "_filter_chat_list"):
+            self.window._filter_chat_list(self.window._chat_search.text())
 
     def rename_chat_by_id(self, chat_id: str, current_title: str):
         dlg = RenameChatDialog(current_title, self.window)

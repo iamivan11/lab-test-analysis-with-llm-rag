@@ -2,50 +2,36 @@ from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
-    QListWidget,
+    QLineEdit,
     QMainWindow,
-    QMenu,
     QPushButton,
-    QTextBrowser,
-    QTextEdit,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from config import APP_NAME
+from config import (
+    APP_NAME,
+    is_onboarding_complete,
+    save_model_path,
+    set_onboarding_complete,
+)
 from core.chat_store import list_chats, load_chat, new_chat
 from core.llm_engine import stop_server
 from core.logger import log
 from ui.chat import ChatController
+from ui.chat.widgets import AutoHideScrollListWidget, ChatDisplayBrowser, PlainTextPasteEdit
 from ui.documents import DocumentsController
-from ui.models import ModelController, ModelHubDialog
+from ui.models import ModelController
+from ui.onboarding import (
+    DocumentsSetupScreen,
+    ModelDownloadScreen,
+    ProfileSetupScreen,
+    WelcomeScreen,
+)
 from ui.profile import ProfileController
+from ui.screens import HomeScreen
 from ui.styles import STYLESHEET
-
-
-class PlainTextPasteEdit(QTextEdit):
-    """QTextEdit that always pastes plain text from the clipboard."""
-
-    def insertFromMimeData(self, source) -> None:
-        self.insertPlainText(source.text())
-
-
-class ChatDisplayBrowser(QTextBrowser):
-    """QTextBrowser with a minimal text-only context menu."""
-
-    def build_context_menu(self) -> QMenu:
-        menu = QMenu(self)
-
-        if self.textCursor().hasSelection():
-            copy_action = menu.addAction("Copy")
-            copy_action.triggered.connect(self.copy)
-
-        select_all_action = menu.addAction("Select All")
-        select_all_action.triggered.connect(self.selectAll)
-        return menu
-
-    def contextMenuEvent(self, event) -> None:
-        self.build_context_menu().exec(event.globalPos())
 
 
 class MainWindow(QMainWindow):
@@ -71,23 +57,109 @@ class MainWindow(QMainWindow):
         self._pending_prompt = ""
         self._compression_attempted = False
         self._generation_stopped = False
-        self._docs_dialog = None
-        self._hub_dialog: ModelHubDialog | None = None
         self._parsing_active = False
         self._download_worker = None
         self._load_token = 0
+        self._hovered_link_range = None
+
+        # Hidden stub kept for compat with ModelController which toggles it.
+        self._model_btn = QPushButton()
+        self._model_btn.setVisible(False)
+
         self._chat_controller = ChatController(self)
         self._documents_controller = DocumentsController(self)
         self._model_controller = ModelController(self)
         self._profile_controller = ProfileController(self)
 
-        self._build_ui()
-        self._init_chat()
-        self._try_load_saved_model()
+        self._stack = QStackedWidget()
+        self.setCentralWidget(self._stack)
 
-    def _build_ui(self):
+        self._chat_widget = self._build_chat_screen()
+        self._welcome_screen = WelcomeScreen()
+        self._profile_setup_screen = ProfileSetupScreen()
+        self._model_download_screen = ModelDownloadScreen()
+        self._documents_setup_screen = DocumentsSetupScreen()
+        self._home_screen = HomeScreen(
+            chat_widget=self._chat_widget,
+            build_profile_context=self._build_profile_context,
+        )
+
+        for screen in (
+            self._welcome_screen,
+            self._profile_setup_screen,
+            self._model_download_screen,
+            self._documents_setup_screen,
+            self._home_screen,
+        ):
+            self._stack.addWidget(screen)
+
+        self._wire_screens()
+        self._init_chat()
+
+        if is_onboarding_complete():
+            self._stack.setCurrentWidget(self._home_screen)
+            self._try_load_saved_model()
+        else:
+            self._stack.setCurrentWidget(self._welcome_screen)
+
+    # ── Screen wiring ──────────────────────────────────────────────────────
+
+    def _wire_screens(self):
+        self._welcome_screen.start_clicked.connect(self._show_profile_setup)
+        self._profile_setup_screen.continue_clicked.connect(self._show_model_download)
+        self._model_download_screen.proceed_clicked.connect(self._on_model_download_proceed)
+        self._model_download_screen.back_clicked.connect(self._show_profile_setup)
+        self._documents_setup_screen.proceed_clicked.connect(self._on_documents_setup_proceed)
+        self._documents_setup_screen.back_clicked.connect(self._show_model_download)
+        self._documents_setup_screen.docs.model_swapped.connect(self._on_docs_model_swapped)
+        self._documents_setup_screen.docs.parsing_active_changed.connect(
+            self._on_parsing_active_changed
+        )
+
+        # Home-embedded sections.
+        self._home_screen.documents.model_swapped.connect(self._on_docs_model_swapped)
+        self._home_screen.documents.parsing_active_changed.connect(self._on_parsing_active_changed)
+        self._home_screen.model_hub.load_requested.connect(self._on_hub_load_requested)
+        self._home_screen.model_hub.loaded_model_deleted.connect(self._ensure_default_model)
+
+    def _show_welcome(self):
+        self._stack.setCurrentWidget(self._welcome_screen)
+
+    def _show_profile_setup(self):
+        self._profile_setup_screen.reload()
+        self._stack.setCurrentWidget(self._profile_setup_screen)
+
+    def _show_model_download(self):
+        self._stack.setCurrentWidget(self._model_download_screen)
+        self._model_download_screen.start()
+
+    def _on_model_download_proceed(self, model_path: str):
+        save_model_path(model_path)
+        self._load_model(model_path)
+        self._stack.setCurrentWidget(self._documents_setup_screen)
+
+    def _on_documents_setup_proceed(self):
+        if self._documents_setup_screen.docs.is_busy():
+            return
+        set_onboarding_complete(True)
+        self._show_home()
+
+    def _show_home(self):
+        # Resetting Home to its default tile (Profile) keeps the Back button
+        # in the chat top bar meaningful: it returns the user to the
+        # default Home view.
+        self._home_screen.show_profile()
+        self._stack.setCurrentWidget(self._home_screen)
+
+    def _on_hub_load_requested(self, model_path: str):
+        save_model_path(model_path)
+        self._load_model(model_path)
+        self._home_screen.show_chat()
+
+    # ── Chat screen build ──────────────────────────────────────────────────
+
+    def _build_chat_screen(self) -> QWidget:
         central = QWidget()
-        self.setCentralWidget(central)
 
         outer = QHBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -101,13 +173,14 @@ class MainWindow(QMainWindow):
         sidebar_layout.setContentsMargins(12, 16, 12, 16)
         sidebar_layout.setSpacing(8)
 
-        new_chat_btn = QPushButton("New Chat")
-        new_chat_btn.setObjectName("attachButton")
-        new_chat_btn.setFixedHeight(38)
-        new_chat_btn.clicked.connect(self._new_chat)
-        sidebar_layout.addWidget(new_chat_btn)
+        self._chat_search = QLineEdit()
+        self._chat_search.setPlaceholderText("Search chats...")
+        self._chat_search.setClearButtonEnabled(True)
+        self._chat_search.setFixedHeight(38)
+        self._chat_search.textChanged.connect(self._filter_chat_list)
+        sidebar_layout.addWidget(self._chat_search)
 
-        self._chat_list = QListWidget()
+        self._chat_list = AutoHideScrollListWidget()
         self._chat_list.setObjectName("chatList")
         self._chat_list.itemClicked.connect(self._on_chat_selected)
         self._chat_list.itemDoubleClicked.connect(self._on_chat_rename)
@@ -115,34 +188,11 @@ class MainWindow(QMainWindow):
         self._chat_list.customContextMenuRequested.connect(self._on_chat_context_menu)
         sidebar_layout.addWidget(self._chat_list, stretch=1)
 
-        settings_btn = QPushButton("Settings")
-        settings_btn.setObjectName("attachButton")
-        settings_btn.setFixedHeight(38)
-        settings_btn.clicked.connect(self._open_settings)
-        sidebar_layout.addWidget(settings_btn)
-
-        chip_style = (
-            "font-size: 11px; color: #cdd6f4; background: #313244;"
-            "border: 1px solid #45475a; border-radius: 8px;"
-            "padding: 3px 8px;"
-        )
-        self._mem_chip = QLabel("Memory ...")
-        self._mem_chip.setStyleSheet(chip_style)
-        self._mem_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._cpu_chip = QLabel("CPU ...")
-        self._cpu_chip.setStyleSheet(chip_style)
-        self._cpu_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        chips_row = QHBoxLayout()
-        chips_row.setSpacing(6)
-        chips_row.addWidget(self._mem_chip)
-        chips_row.addWidget(self._cpu_chip)
-        sidebar_layout.addLayout(chips_row)
-
-        self._stats_timer = QTimer(self)
-        self._stats_timer.timeout.connect(self._update_stats)
-        self._stats_timer.start(2000)
-        self._update_stats()
+        new_chat_btn = QPushButton("New Chat")
+        new_chat_btn.setObjectName("attachButton")
+        new_chat_btn.setFixedHeight(38)
+        new_chat_btn.clicked.connect(self._new_chat)
+        sidebar_layout.addWidget(new_chat_btn)
 
         outer.addWidget(self._sidebar)
 
@@ -152,7 +202,7 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(12)
 
-        # Top bar
+        # Top bar — hamburger + Home + status
         top_row = QHBoxLayout()
 
         self._sidebar_btn = QPushButton("☰")
@@ -161,44 +211,37 @@ class MainWindow(QMainWindow):
         self._sidebar_btn.clicked.connect(self._toggle_sidebar)
         top_row.addWidget(self._sidebar_btn)
 
-        self._hub_btn = QPushButton("Model Hub")
-        self._hub_btn.setObjectName("attachButton")
-        self._hub_btn.setStyleSheet("font-size: 13px;")
-        self._hub_btn.clicked.connect(self._open_model_hub)
-        top_row.addWidget(self._hub_btn)
-
-        self._model_btn = QPushButton("Load Model")
-        self._model_btn.setObjectName("loadModelButton")
-        self._model_btn.setStyleSheet("font-size: 13px;")
-        self._model_btn.clicked.connect(self._select_model)
-        top_row.addWidget(self._model_btn)
+        chip_style = (
+            "font-size: 11px; color: #cdd6f4; background: #313244;"
+            "border: 1px solid #45475a; border-radius: 8px;"
+            "padding: 3px 8px;"
+        )
 
         self._status_label = QLabel("No model loaded")
-        self._status_label.setObjectName("statusLabel")
-        top_row.addWidget(self._status_label, stretch=1)
+        self._status_label.setStyleSheet(chip_style)
+        self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_row.addWidget(self._status_label)
 
-        self._docs_btn = QPushButton("Documents")
-        self._docs_btn.setObjectName("attachButton")
-        self._docs_btn.setStyleSheet("font-size: 13px;")
-        self._docs_btn.clicked.connect(self._open_documents_hub)
-        top_row.addWidget(self._docs_btn)
+        self._mem_chip = QLabel("Memory ...")
+        self._mem_chip.setStyleSheet(chip_style)
+        self._mem_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_row.addWidget(self._mem_chip)
 
-        self._profile_btn = QPushButton("Profile")
-        self._profile_btn.setObjectName("attachButton")
-        self._profile_btn.clicked.connect(self._open_profile)
-        top_row.addWidget(self._profile_btn)
+        self._cpu_chip = QLabel("CPU ...")
+        self._cpu_chip.setStyleSheet(chip_style)
+        self._cpu_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        top_row.addWidget(self._cpu_chip)
 
-        # Make all four top-bar buttons the same size
-        btn_w = max(
-            self._model_btn.sizeHint().width(),
-            self._hub_btn.sizeHint().width(),
-            self._docs_btn.sizeHint().width(),
-            self._profile_btn.sizeHint().width(),
-        )
-        for btn in (self._model_btn, self._hub_btn, self._docs_btn, self._profile_btn):
-            btn.setFixedSize(btn_w, 38)
+        top_row.addStretch()
 
         main_layout.addLayout(top_row)
+
+        # Stats timer set up here (after chips exist) so the first
+        # _update_stats() call doesn't reference a not-yet-created chip.
+        self._stats_timer = QTimer(self)
+        self._stats_timer.timeout.connect(self._update_stats)
+        self._stats_timer.start(2000)
+        self._update_stats()
 
         # Chat display
         self._chat_display = ChatDisplayBrowser()
@@ -207,7 +250,6 @@ class MainWindow(QMainWindow):
         self._chat_display.setOpenLinks(False)
         self._chat_display.setOpenExternalLinks(False)
         self._chat_display.anchorClicked.connect(self._on_link_clicked)
-        self._hovered_link_range = None
         self._chat_display.setPlaceholderText("Chat will appear here...")
         main_layout.addWidget(self._chat_display, stretch=1)
 
@@ -223,15 +265,13 @@ class MainWindow(QMainWindow):
         btn_column.setContentsMargins(0, 0, 0, 0)
         btn_column.setSpacing(BTN_SPACING)
 
-        # Row 1: [■]
-        self._stop_btn = QPushButton("\u25a0")
+        self._stop_btn = QPushButton("■")
         self._stop_btn.setObjectName("stopButton")
         self._stop_btn.setFixedSize(BTN_H * 2 + 4, BTN_H)
         self._stop_btn.setEnabled(False)
         self._stop_btn.clicked.connect(self._stop_generation)
         btn_column.addWidget(self._stop_btn)
 
-        # Row 2: [Send]
         self._send_btn = QPushButton("Send")
         self._send_btn.setFixedSize(BTN_H * 2 + 4, BTN_H)
         self._send_btn.setEnabled(False)
@@ -252,10 +292,11 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(input_row)
         outer.addWidget(main_widget, stretch=1)
 
+        return central
+
     # ── Chat management ────────────────────────────────────────────────────
 
     def _init_chat(self):
-        """Load the most recent chat on startup, or start with a blank one."""
         chats = list_chats()
         log("UI", f"_init_chat: found {len(chats)} existing chats")
         if chats:
@@ -283,6 +324,13 @@ class MainWindow(QMainWindow):
 
     def _refresh_chat_list(self):
         self._chat_controller.refresh_chat_list()
+
+    def _filter_chat_list(self, query: str):
+        q = query.strip().lower()
+        for i in range(self._chat_list.count()):
+            item = self._chat_list.item(i)
+            title = item.data(Qt.ItemDataRole.UserRole + 1) or ""
+            item.setHidden(bool(q) and q not in str(title).lower())
 
     def _rename_chat_by_id(self, chat_id: str, current_title: str):
         self._chat_controller.rename_chat_by_id(chat_id, current_title)
@@ -343,16 +391,7 @@ class MainWindow(QMainWindow):
         self._mem_chip.setText(f"Memory {used_gb:.1f}/{total_gb:.1f} GB")
         self._cpu_chip.setText(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
 
-    # ── Profile ────────────────────────────────────────────────────────────
-
-    def _open_settings(self):
-        from ui.settings_dialog import SettingsDialog
-
-        dlg = SettingsDialog(parent=self)
-        dlg.exec()
-
-    def _open_profile(self):
-        self._profile_controller.open_profile()
+    # ── Profile / app actions ──────────────────────────────────────────────
 
     def _build_profile_context(self) -> str:
         return self._profile_controller.build_profile_context()
@@ -374,16 +413,6 @@ class MainWindow(QMainWindow):
 
     def _select_model(self):
         self._model_controller.select_model()
-
-    def _open_model_hub(self):
-        if self._hub_dialog is None:
-            self._hub_dialog = ModelHubDialog(self)
-        self._hub_dialog.show()
-        self._hub_dialog.raise_()
-        self._hub_dialog.activateWindow()
-
-    def _open_documents_hub(self):
-        self._documents_controller.open_documents_hub()
 
     def _on_docs_model_swapped(self, model_path: str, display_name: str):
         self._documents_controller.on_docs_model_swapped(model_path, display_name)

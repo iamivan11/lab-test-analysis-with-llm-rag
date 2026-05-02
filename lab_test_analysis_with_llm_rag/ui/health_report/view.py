@@ -1,0 +1,285 @@
+import shutil
+
+from PySide6.QtCore import Qt
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPdfWidgets import QPdfView
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from config import load_max_tokens
+from core.health_report import (
+    HEALTH_REPORT_MD,
+    HEALTH_REPORT_PDF,
+    delete_report,
+    list_uploaded_documents,
+    new_documents_since_last_report,
+    report_exists,
+)
+from ui.health_report.workers import HealthReportWorker
+
+
+def _format_time(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    minutes, sec = divmod(s, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+class HealthReportContent(QWidget):
+    """Generates, updates, deletes, and renders the synthesized health report."""
+
+    def __init__(self, build_profile_context, parent=None):
+        super().__init__(parent)
+        self._build_profile_context = build_profile_context
+        self._worker: HealthReportWorker | None = None
+        self._token_count = 0
+        self._token_max = 0
+        self._gen_start_monotonic: float | None = None
+        self._mode_label = ""
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._generate_btn = QPushButton("Generate")
+        self._generate_btn.setFixedSize(120, 38)
+        self._generate_btn.clicked.connect(lambda: self._kick_off("full"))
+        btn_row.addWidget(self._generate_btn)
+
+        self._update_btn = QPushButton("Update")
+        self._update_btn.setObjectName("attachButton")
+        self._update_btn.setFixedSize(120, 38)
+        self._update_btn.clicked.connect(lambda: self._kick_off("update"))
+        btn_row.addWidget(self._update_btn)
+
+        btn_row.addStretch()
+
+        self._download_btn = QPushButton("Download")
+        self._download_btn.setObjectName("attachButton")
+        self._download_btn.setFixedSize(120, 38)
+        self._download_btn.clicked.connect(self._download)
+        btn_row.addWidget(self._download_btn)
+
+        self._delete_btn = QPushButton("Delete")
+        self._delete_btn.setObjectName("attachButton")
+        self._delete_btn.setFixedSize(120, 38)
+        self._delete_btn.clicked.connect(self._delete)
+        btn_row.addWidget(self._delete_btn)
+
+        layout.addLayout(btn_row)
+
+        self._status_label = QLabel("")
+        self._status_label.setObjectName("statusLabel")
+        layout.addWidget(self._status_label)
+
+        self._progress_widget = QWidget()
+        progress_row = QHBoxLayout(self._progress_widget)
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(8)
+
+        self._progress = QProgressBar()
+        self._progress.setMinimum(0)
+        self._progress.setMaximum(0)
+        self._progress.setTextVisible(False)
+        self._progress.setFixedHeight(8)
+        progress_row.addWidget(self._progress, stretch=1)
+
+        self._cancel_btn = QPushButton("✕")
+        self._cancel_btn.setObjectName("iconSecondary")
+        self._cancel_btn.setFixedSize(28, 28)
+        self._cancel_btn.setToolTip("Cancel")
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        progress_row.addWidget(self._cancel_btn)
+
+        self._progress_widget.setVisible(False)
+        layout.addWidget(self._progress_widget)
+
+        self._pdf_doc = QPdfDocument(self)
+        self._pdf_view = QPdfView()
+        self._pdf_view.setDocument(self._pdf_doc)
+        self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+        self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+        layout.addWidget(self._pdf_view, stretch=1)
+
+        self._empty_label = QLabel(
+            "No report yet. Click Generate to create one from your "
+            "uploaded medical documents."
+        )
+        self._empty_label.setObjectName("statusLabel")
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._empty_label, stretch=1)
+
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._reload_pdf()
+        self._update_button_states()
+
+    def _kick_off(self, mode: str) -> None:
+        if self._is_busy():
+            return
+        if mode == "full" and not list_uploaded_documents():
+            self._status_label.setText("Upload at least one document first.")
+            return
+        if mode == "update":
+            if not report_exists():
+                return
+            if not new_documents_since_last_report():
+                return
+
+        from core.llm_engine import is_server_running
+
+        if not is_server_running():
+            self._status_label.setText(
+                "No AI model is loaded. Open the Models tab and click "
+                "Load on the model you want to use, then try again."
+            )
+            return
+
+        self._start(mode)
+
+    def _start(self, mode: str) -> None:
+        if mode == "update":
+            doc_names = new_documents_since_last_report()
+            if not doc_names:
+                self._set_busy(False)
+                return
+            existing_md = HEALTH_REPORT_MD.read_text(encoding="utf-8")
+        else:
+            doc_names = list_uploaded_documents()
+            existing_md = ""
+
+        max_tokens = max(load_max_tokens() or 4096, 16384)
+        self._token_count = 0
+        self._token_max = max_tokens
+        self._gen_start_monotonic = None
+        self._mode_label = "Generating report" if mode == "full" else "Updating report"
+
+        self._progress.setMinimum(0)
+        self._progress.setMaximum(0)
+        self._progress.setValue(0)
+        self._set_busy(True)
+        self._cancel_btn.setEnabled(True)
+        self._status_label.setText(self._mode_label + "...")
+
+        self._worker = HealthReportWorker(
+            mode=mode,
+            profile_context=self._build_profile_context(),
+            document_names=doc_names,
+            existing_markdown=existing_md,
+            max_tokens=max_tokens,
+        )
+        self._worker.progress.connect(self._status_label.setText)
+        self._worker.token.connect(self._on_token)
+        self._worker.finished_ok.connect(self._on_finished)
+        self._worker.error_occurred.connect(self._on_error)
+        self._worker.cancelled.connect(self._on_cancelled)
+        self._worker.start()
+
+    def _delete(self) -> None:
+        if self._is_busy() or not report_exists():
+            return
+        self._pdf_doc.close()
+        delete_report()
+        self._status_label.setText("Report deleted.")
+        self.refresh()
+
+    def _download(self) -> None:
+        if not HEALTH_REPORT_PDF.exists():
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Save Health Report", "health_report.pdf", "PDF Files (*.pdf)"
+        )
+        if dest:
+            try:
+                shutil.copy2(HEALTH_REPORT_PDF, dest)
+                self._status_label.setText(f"Saved to {dest}")
+            except OSError as e:
+                self._status_label.setText(f"Save failed: {e}")
+
+    def _on_token(self, _tok: str) -> None:
+        import time
+
+        if self._gen_start_monotonic is None:
+            self._gen_start_monotonic = time.monotonic()
+            self._progress.setMaximum(self._token_max)
+            self._progress.setValue(0)
+
+        self._token_count += 1
+        self._progress.setValue(min(self._token_count, self._token_max))
+
+        if self._token_count > 1 and self._token_count % 10 != 0:
+            return
+
+        elapsed = max(time.monotonic() - self._gen_start_monotonic, 1e-3)
+        rate = self._token_count / elapsed
+        remaining = max(0, self._token_max - self._token_count)
+        eta = remaining / rate if rate > 0 else 0
+        self._status_label.setText(
+            f"{self._mode_label}: {self._token_count} / {self._token_max} tokens "
+            f"• {rate:.1f} tok/s • ~{_format_time(eta)} left"
+        )
+
+    def _on_finished(self) -> None:
+        self._set_busy(False)
+        self._status_label.setText("Report ready.")
+        self.refresh()
+
+    def _on_error(self, msg: str) -> None:
+        self._set_busy(False)
+        self._status_label.setText(f"Error: {msg}")
+        self._update_button_states()
+
+    def _on_cancelled(self) -> None:
+        self._set_busy(False)
+        self._status_label.setText("Cancelled.")
+        self._update_button_states()
+
+    def _on_cancel(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._cancel_btn.setEnabled(False)
+            self._status_label.setText("Cancelling...")
+
+    def _is_busy(self) -> bool:
+        worker_running = self._worker is not None and self._worker.isRunning()
+        return worker_running or self._progress_widget.isVisible()
+
+    def _set_busy(self, busy: bool) -> None:
+        self._progress_widget.setVisible(busy)
+        self._update_button_states()
+
+    def _update_button_states(self) -> None:
+        busy = self._is_busy()
+        has_docs = bool(list_uploaded_documents())
+        has_report = report_exists()
+        has_new = bool(new_documents_since_last_report())
+
+        self._generate_btn.setEnabled(not busy and has_docs)
+        self._update_btn.setEnabled(not busy and has_report and has_new)
+        self._delete_btn.setEnabled(not busy and has_report)
+        self._download_btn.setEnabled(not busy and has_report)
+
+    def _reload_pdf(self) -> None:
+        if HEALTH_REPORT_PDF.exists():
+            self._pdf_doc.close()
+            self._pdf_doc.load(str(HEALTH_REPORT_PDF))
+            self._pdf_view.setVisible(True)
+            self._empty_label.setVisible(False)
+        else:
+            self._pdf_doc.close()
+            self._pdf_view.setVisible(False)
+            self._empty_label.setVisible(True)

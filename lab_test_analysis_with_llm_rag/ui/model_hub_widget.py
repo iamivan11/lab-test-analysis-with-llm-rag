@@ -1,10 +1,9 @@
-"""Dialog for browsing and downloading GGUF models from HuggingFace."""
+"""Reusable Model Hub widget."""
 
-import threading
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -13,124 +12,137 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from config import format_size
+from config import DEFAULT_MODEL_FILE, MODELS_DIR, format_size
+from core.llm_engine import get_current_model_path
 from core.logger import log
-from core.model_hub import (
-    download_model,
-    list_gguf_files,
-    search_models,
-)
-from ui.styles import STYLESHEET
+from ui.model_file_helpers import is_main_model, model_display_name
+from ui.model_hub_workers import DownloadWorker, FileListWorker, SearchWorker
 
 
-class SearchWorker(QThread):
-    finished = Signal(list)
-    error_occurred = Signal(str)
+class ModelHubWidget(QWidget):
+    """Tabs for local models and HuggingFace GGUF downloads."""
 
-    def __init__(self, query: str):
-        super().__init__()
-        self.query = query
-
-    def run(self):
-        log("WORKER", f"SearchWorker: query='{self.query}'")
-        try:
-            results = search_models(self.query)
-            log("WORKER", f"SearchWorker: found {len(results)} models")
-            self.finished.emit(results)
-        except Exception as e:
-            log("WORKER", f"SearchWorker: ERROR {e}")
-            self.error_occurred.emit(str(e))
-
-
-class FileListWorker(QThread):
-    finished = Signal(list)
-    error_occurred = Signal(str)
-
-    def __init__(self, model_id: str):
-        super().__init__()
-        self.model_id = model_id
-
-    def run(self):
-        log("WORKER", f"FileListWorker: loading files for {self.model_id}")
-        try:
-            files = list_gguf_files(self.model_id)
-            log("WORKER", f"FileListWorker: found {len(files)} GGUF files")
-            self.finished.emit(files)
-        except Exception as e:
-            log("WORKER", f"FileListWorker: ERROR {e}")
-            self.error_occurred.emit(str(e))
-
-
-class DownloadWorker(QThread):
-    progress = Signal(int, str)  # (percentage, "downloaded / total" label)
-    finished = Signal(str)
-    error_occurred = Signal(str)
-
-    def __init__(self, model_id: str, filename: str):
-        super().__init__()
-        self.model_id = model_id
-        self.filename = filename
-        self._stop_event = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
-
-    def run(self):
-        log("WORKER", f"DownloadWorker: downloading {self.filename} from {self.model_id}")
-        try:
-
-            def on_progress(downloaded: int, total: int):
-                pct = int(downloaded * 100 / total) if total > 0 else 0
-                label = (
-                    f"{format_size(downloaded)} / {format_size(total)}"
-                    if total
-                    else format_size(downloaded)
-                )
-                self.progress.emit(pct, label)
-
-            path = download_model(
-                self.model_id,
-                self.filename,
-                on_progress=on_progress,
-                stop_event=self._stop_event,
-            )
-            log("WORKER", f"DownloadWorker: done, saved to {path}")
-            self.finished.emit(str(path))
-        except InterruptedError:
-            log("WORKER", "DownloadWorker: cancelled")
-            self.error_occurred.emit("Download cancelled")
-        except Exception as e:
-            log("WORKER", f"DownloadWorker: ERROR {e}")
-            self.error_occurred.emit(str(e))
-
-
-class ModelHubDialog(QDialog):
+    load_requested = Signal(str)
+    loaded_model_deleted = Signal()
     model_downloaded = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Model Hub")
-        self.setMinimumSize(700, 500)
-        self.setStyleSheet(STYLESHEET)
 
         self._search_worker = None
         self._file_worker = None
         self._download_worker = None
         self._selected_model_id = ""
         self._search_results = []
+        self._local_paths: list[str] = []
 
         self._build_ui()
+        self.refresh_local()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # Search bar
+        self._tabs = QTabWidget()
+        self._tabs.addTab(self._build_local_tab(), "My Models")
+        self._tabs.addTab(self._build_browse_tab(), "Download")
+        layout.addWidget(self._tabs, stretch=1)
+
+    def _build_local_tab(self) -> QWidget:
+        wrap = QWidget()
+        wrap_layout = QVBoxLayout(wrap)
+        wrap_layout.setSpacing(12)
+        wrap_layout.setContentsMargins(0, 12, 0, 0)
+
+        self._local_table = QTableWidget(0, 4)
+        self._local_table.setHorizontalHeaderLabels(["Model", "Size", "", ""])
+        self._local_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._local_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._local_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._local_table.verticalHeader().setVisible(False)
+        local_header = self._local_table.horizontalHeader()
+        local_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        local_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        local_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        local_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        wrap_layout.addWidget(self._local_table, stretch=1)
+
+        self._local_empty = QLabel("No local models yet — switch to 'Browse & Download'.")
+        self._local_empty.setObjectName("statusLabel")
+        self._local_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._local_empty.setVisible(False)
+        wrap_layout.addWidget(self._local_empty)
+
+        return wrap
+
+    def refresh_local(self):
+        models = sorted(
+            [p for p in MODELS_DIR.glob("*.gguf") if is_main_model(p)],
+            key=lambda p: p.name.lower(),
+        )
+        self._local_paths = [str(p) for p in models]
+        self._local_table.setRowCount(len(models))
+        loaded_path = get_current_model_path()
+
+        if not models:
+            self._local_table.setVisible(False)
+            self._local_empty.setVisible(True)
+            return
+
+        self._local_table.setVisible(True)
+        self._local_empty.setVisible(False)
+
+        for row, path in enumerate(models):
+            is_loaded = str(path) == loaded_path
+
+            name_item = QTableWidgetItem(model_display_name(path, fallback=path.stem))
+            size_item = QTableWidgetItem(format_size(path.stat().st_size))
+            size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._local_table.setItem(row, 0, name_item)
+            self._local_table.setItem(row, 1, size_item)
+
+            load_btn = QPushButton("Load")
+            load_btn.setObjectName("attachButton")
+            load_btn.setFixedSize(72, 28)
+            load_btn.setStyleSheet("padding: 0 6px; font-size: 11px;")
+            if is_loaded:
+                load_btn.setEnabled(False)
+                load_btn.setText("Loaded")
+            else:
+                load_btn.clicked.connect(lambda _, p=str(path): self.load_requested.emit(p))
+            self._local_table.setCellWidget(row, 2, load_btn)
+
+            del_btn = QPushButton("−")  # noqa: RUF001 - UI glyph, not arithmetic.
+            del_btn.setObjectName("iconSecondary")
+            del_btn.setFixedSize(28, 28)
+            if path.name == DEFAULT_MODEL_FILE:
+                del_btn.setEnabled(False)
+                del_btn.setToolTip("Default model — cannot be deleted")
+            else:
+                del_btn.setToolTip("Delete")
+                del_btn.clicked.connect(lambda _, p=path: self._delete_local(p))
+            self._local_table.setCellWidget(row, 3, del_btn)
+
+    def _delete_local(self, path: Path):
+        log("MODELS", f"Deleting model: {path.name}")
+        was_loaded = get_current_model_path() == str(path)
+        path.unlink(missing_ok=True)
+        self.refresh_local()
+        if was_loaded:
+            self.loaded_model_deleted.emit()
+
+    def _build_browse_tab(self) -> QWidget:
+        wrap = QWidget()
+        layout = QVBoxLayout(wrap)
+        layout.setSpacing(12)
+        layout.setContentsMargins(0, 12, 0, 0)
+
         search_row = QHBoxLayout()
         search_row.setSpacing(8)
 
@@ -146,12 +158,10 @@ class ModelHubDialog(QDialog):
 
         layout.addLayout(search_row)
 
-        # Status label
         self._status = QLabel("")
         self._status.setObjectName("statusLabel")
         layout.addWidget(self._status)
 
-        # Models table
         self._models_table = QTableWidget(0, 2)
         self._models_table.setHorizontalHeaderLabels(["Model", "Downloads"])
         self._models_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -164,7 +174,6 @@ class ModelHubDialog(QDialog):
         self._models_table.cellClicked.connect(self._on_model_clicked)
         layout.addWidget(self._models_table, stretch=1)
 
-        # Files table (shown after selecting a model)
         self._files_label = QLabel("")
         self._files_label.setVisible(False)
         layout.addWidget(self._files_label)
@@ -183,7 +192,6 @@ class ModelHubDialog(QDialog):
         self._files_table.setMaximumHeight(180)
         layout.addWidget(self._files_table)
 
-        # Download progress
         self._progress_widget = QWidget()
         self._progress_widget.setVisible(False)
         progress_layout = QHBoxLayout(self._progress_widget)
@@ -200,7 +208,7 @@ class ModelHubDialog(QDialog):
         self._progress_label.setMinimumWidth(100)
         progress_layout.addWidget(self._progress_label)
 
-        self._cancel_btn = QPushButton("\u2715")
+        self._cancel_btn = QPushButton("✕")
         self._cancel_btn.setObjectName("iconSecondary")
         self._cancel_btn.setFixedSize(28, 28)
         self._cancel_btn.setToolTip("Cancel")
@@ -208,18 +216,7 @@ class ModelHubDialog(QDialog):
         progress_layout.addWidget(self._cancel_btn)
 
         layout.addWidget(self._progress_widget)
-
-        # Bottom buttons
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("attachButton")
-        close_btn.setFixedSize(100, 38)
-        close_btn.clicked.connect(self.reject)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-
-    # ── Search ────────────────────────────────────────────────────────────
+        return wrap
 
     def _do_search(self):
         query = self._search_input.text().strip()
@@ -256,8 +253,6 @@ class ModelHubDialog(QDialog):
         self._search_btn.setEnabled(True)
         self._status.setText(f"Search error: {error}")
 
-    # ── File listing ──────────────────────────────────────────────────────
-
     def _on_model_clicked(self, row: int, _col: int):
         if row >= len(self._search_results):
             return
@@ -286,17 +281,15 @@ class ModelHubDialog(QDialog):
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self._files_table.setItem(row, 1, size_item)
 
-            dl_btn = QPushButton("\u2193")
+            dl_btn = QPushButton("↓")
             dl_btn.setObjectName("iconPrimary")
             dl_btn.setFixedSize(28, 28)
             dl_btn.setToolTip("Download")
-            dl_btn.clicked.connect(lambda checked, name=f["name"]: self._start_download(name))
+            dl_btn.clicked.connect(lambda _, name=f["name"]: self._start_download(name))
             self._files_table.setCellWidget(row, 2, dl_btn)
 
     def _on_files_error(self, error: str):
         self._files_label.setText(f"Error loading files: {error}")
-
-    # ── Download ──────────────────────────────────────────────────────────
 
     def _start_download(self, filename: str):
         log("HUB", f"Starting download: {filename} from {self._selected_model_id}")
@@ -325,6 +318,7 @@ class ModelHubDialog(QDialog):
         self._progress_widget.setVisible(False)
         self._status.setText(f"Downloaded to {path}")
         self.model_downloaded.emit(path)
+        self.refresh_local()
 
     def _on_download_error(self, error: str):
         self._progress_widget.setVisible(False)

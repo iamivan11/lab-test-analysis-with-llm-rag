@@ -1,11 +1,10 @@
-"""Dialog for managing uploaded lab test documents."""
+"""Documents content widget — manage uploaded lab test documents."""
 
 import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -28,18 +27,16 @@ from ui.documents.workers import (
     EnsureVisionModelWorker,
     IndexWorker,
 )
-from ui.styles import STYLESHEET
 
 
-class DocumentsHubDialog(QDialog):
+class DocumentsHubWidget(QWidget):
+    """Documents management UI without a host dialog/window chrome."""
+
     model_swapped = Signal(str, str)
     parsing_active_changed = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Documents")
-        self.setMinimumSize(600, 400)
-        self.setStyleSheet(STYLESHEET)
         self._index_worker = None
         self._ensure_worker = None
         self._pending_files: list[Path] = []
@@ -52,32 +49,33 @@ class DocumentsHubDialog(QDialog):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        header_row = QHBoxLayout()
-
-        header_row.addStretch()
+        # Public so a host screen can inject extra leading widgets (e.g. a
+        # Back button on the Documents-section page).
+        self.header_row = QHBoxLayout()
+        self.header_row.addStretch()
 
         self._upload_btn = QPushButton("Upload")
         self._upload_btn.setFixedSize(100, 38)
         self._upload_btn.clicked.connect(self._upload_files)
-        header_row.addWidget(self._upload_btn)
+        self.header_row.addWidget(self._upload_btn)
 
         self._reindex_btn = QPushButton("Reindex")
         self._reindex_btn.setObjectName("attachButton")
         self._reindex_btn.setFixedSize(100, 38)
         self._reindex_btn.setEnabled(False)
         self._reindex_btn.clicked.connect(self._reindex_files)
-        header_row.addWidget(self._reindex_btn)
+        self.header_row.addWidget(self._reindex_btn)
 
         self._delete_all_btn = QPushButton("Delete All")
         self._delete_all_btn.setObjectName("attachButton")
         self._delete_all_btn.setFixedSize(100, 38)
         self._delete_all_btn.setEnabled(False)
         self._delete_all_btn.clicked.connect(self._delete_all)
-        header_row.addWidget(self._delete_all_btn)
+        self.header_row.addWidget(self._delete_all_btn)
 
-        layout.addLayout(header_row)
+        layout.addLayout(self.header_row)
 
         self._status = QLabel("")
         self._status.setObjectName("statusLabel")
@@ -93,7 +91,7 @@ class DocumentsHubDialog(QDialog):
         self._progress_bar.setFormat("%v / %m files")
         progress_row.addWidget(self._progress_bar, stretch=1)
 
-        self._cancel_btn = QPushButton("\u2715")
+        self._cancel_btn = QPushButton("✕")
         self._cancel_btn.setObjectName("iconSecondary")
         self._cancel_btn.setFixedSize(28, 28)
         self._cancel_btn.setToolTip("Cancel")
@@ -115,14 +113,10 @@ class DocumentsHubDialog(QDialog):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self._table, stretch=1)
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.setObjectName("attachButton")
-        close_btn.setFixedSize(100, 38)
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
+    def is_busy(self) -> bool:
+        ensure_running = bool(self._ensure_worker and self._ensure_worker.isRunning())
+        index_running = bool(self._index_worker and self._index_worker.isRunning())
+        return ensure_running or index_running
 
     def _refresh_list(self):
         self._refresh_source_list()
@@ -148,7 +142,7 @@ class DocumentsHubDialog(QDialog):
             self._table.setItem(row, 1, size_item)
 
             if deletable:
-                del_btn = QPushButton("\u2212")
+                del_btn = QPushButton("−")  # noqa: RUF001 - UI glyph, not arithmetic.
                 del_btn.setObjectName("iconSecondary")
                 del_btn.setFixedSize(28, 28)
                 del_btn.setToolTip("Delete")
@@ -366,4 +360,4 @@ class DocumentsHubDialog(QDialog):
         self._refresh_list()
 
 
-__all__ = ["DocumentsHubDialog"]
+__all__ = ["DocumentsHubWidget"]

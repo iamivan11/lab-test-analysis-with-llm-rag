@@ -5,11 +5,14 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-APP_NAME = "Lab Test Analyzer"
+APP_NAME = "Lab Analyzer"
 APP_VERSION = "0.1.0"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TMP_DIR = PROJECT_ROOT / "tmp"
+ICONS_DIR = PROJECT_ROOT / "assets" / "icons"
 
+# Data folder name kept as "Lab Test Analyzer" to preserve existing user
+# data (models, chats, settings, documents) after the rename.
 DATA_DIR = Path.home() / "Library" / "Application Support" / "Lab Test Analyzer"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -30,6 +33,19 @@ DEFAULT_MODEL_REPO = "unsloth/Qwen3.5-9B-GGUF"
 DEFAULT_MODEL_FILE = "Qwen3.5-9B-Q4_K_M.gguf"
 DEFAULT_MMPROJ_FILE = "mmproj-BF16.gguf"
 DEFAULT_MMPROJ_LOCAL = "mmproj-Qwen3.5-9B-BF16.gguf"
+
+# Curated allowlist of HuggingFace repo IDs that are permitted to be
+# downloaded through the Models screen. The Browse / Download tab filters
+# search results against this list, and download_model() refuses anything
+# not on it. Add new IDs here as they get tested and approved.
+ALLOWED_DOWNLOAD_MODEL_IDS: list[str] = [
+    DEFAULT_MODEL_REPO,
+]
+
+# Dev override: when True, the allowlist above is bypassed and ANY GGUF
+# repo can be searched and downloaded. Flip back to False to restore the
+# curated-allowlist behavior.
+ALLOW_ALL_MODEL_DOWNLOADS = True
 
 # Runtime tunables
 SERVER_HOST = "127.0.0.1"
@@ -100,6 +116,7 @@ class AppSettings(BaseModel):
     max_tokens: int | None = None
     model_meta: dict[str, ModelMetaSettings] = Field(default_factory=dict)
     profile: dict[str, str] = Field(default_factory=dict)
+    onboarding_complete: bool = False
 
 
 def _migrate_settings(raw: object) -> dict:
@@ -225,4 +242,14 @@ def load_profile() -> dict:
 def save_profile(profile: dict) -> None:
     data = _load_settings()
     data["profile"] = profile
+    _save_settings(data)
+
+
+def is_onboarding_complete() -> bool:
+    return bool(_load_settings().get("onboarding_complete", False))
+
+
+def set_onboarding_complete(value: bool) -> None:
+    data = _load_settings()
+    data["onboarding_complete"] = value
     _save_settings(data)

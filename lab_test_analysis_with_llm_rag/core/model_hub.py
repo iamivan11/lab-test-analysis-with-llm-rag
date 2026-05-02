@@ -9,6 +9,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from config import (
+    ALLOW_ALL_MODEL_DOWNLOADS,
+    ALLOWED_DOWNLOAD_MODEL_IDS,
     DEFAULT_MMPROJ_FILE,
     DEFAULT_MMPROJ_LOCAL,
     DEFAULT_MODEL_FILE,
@@ -27,7 +29,8 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
     The HF `filter=gguf` tag is loose — some tagged repos hold only
     safetensors. We post-filter by listing each repo's tree in parallel and
     dropping any that has zero `.gguf` files, so non-runnable repos never
-    reach the UI.
+    reach the UI. Results are then filtered against the curated
+    ALLOWED_DOWNLOAD_MODEL_IDS list — only approved repos are surfaced.
     """
     params = urllib.parse.urlencode(
         {
@@ -42,6 +45,7 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
     with urllib.request.urlopen(url, timeout=15) as resp:
         data = json.loads(resp.read().decode())
 
+    allow = set(ALLOWED_DOWNLOAD_MODEL_IDS)
     candidates = [
         {
             "id": m.get("id", ""),
@@ -51,6 +55,7 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
             "last_modified": m.get("lastModified", ""),
         }
         for m in data
+        if ALLOW_ALL_MODEL_DOWNLOADS or m.get("id", "") in allow
     ]
 
     def _has_gguf(model_id: str) -> bool:
@@ -64,7 +69,11 @@ def search_models(query: str, limit: int = 20) -> list[dict]:
         flags = list(pool.map(_has_gguf, [c["id"] for c in candidates]))
 
     filtered = [c for c, ok in zip(candidates, flags, strict=True) if ok]
-    log("HUB", f"search_models: {len(candidates)} candidates -> {len(filtered)} with GGUF files")
+    log(
+        "HUB",
+        f"search_models: {len(data)} HF results -> {len(candidates)} allowed -> "
+        f"{len(filtered)} with GGUF files",
+    )
     return filtered
 
 
@@ -101,6 +110,11 @@ def download_model(
     """
     if not filename.lower().endswith(".gguf"):
         raise ValueError(f"Only .gguf files can be downloaded, got: {filename}")
+
+    if not ALLOW_ALL_MODEL_DOWNLOADS and model_id not in ALLOWED_DOWNLOAD_MODEL_IDS:
+        raise PermissionError(
+            f"Model {model_id!r} is not on the approved download allowlist."
+        )
 
     url = f"{HF_BASE}/{model_id}/resolve/main/{urllib.parse.quote(filename)}"
     dest = MODELS_DIR / filename
