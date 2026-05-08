@@ -38,8 +38,7 @@ def _vertical_spacer(height: int) -> QWidget:
 
 
 class ProfileForm(QWidget):
-    """Reusable profile form (no buttons). Used in both the dialog and the
-    onboarding/profile screen."""
+    """Reusable profile form for onboarding and the Profile screen."""
 
     submitted = Signal()
 

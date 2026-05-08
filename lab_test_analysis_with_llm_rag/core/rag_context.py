@@ -1,14 +1,15 @@
-import httpx
-
 from config import (
     LLM_HYDE_TIMEOUT_SECONDS,
     LLM_QUERY_MODIFICATION_TIMEOUT_SECONDS,
     LLM_RAG_COMPRESSION_TIMEOUT_SECONDS,
     LLM_TOKENIZE_TIMEOUT_SECONDS,
     RAG_DEBUG_DIR,
+    RAG_DEBUG_ENABLED,
     load_ctx_size,
 )
-from core.llm_server import SERVER_URL
+from core.file_io import atomic_write_text
+from core.http_client import post_with_retries
+from core.llm_server import SERVER_URL, get_current_model_path
 from core.logger import log
 from core.prompts import (
     RAG_COMPRESSION_PROMPT,
@@ -17,8 +18,13 @@ from core.prompts import (
     RAG_QUERY_REPHRASE_PROMPT,
 )
 
+_TOKEN_CACHE_MAX_ITEMS = 4096
+_token_count_cache: dict[str, int] = {}
+
 
 def _dump_chunks_for_debug(query: str, chunks: list[dict]) -> None:
+    if not RAG_DEBUG_ENABLED:
+        return
     try:
         if RAG_DEBUG_DIR.exists():
             for old in RAG_DEBUG_DIR.iterdir():
@@ -29,7 +35,8 @@ def _dump_chunks_for_debug(query: str, chunks: list[dict]) -> None:
         width = max(2, len(str(len(chunks))))
         for i, chunk in enumerate(chunks, start=1):
             path = RAG_DEBUG_DIR / f"chunk_{i:0{width}d}.md"
-            path.write_text(
+            atomic_write_text(
+                path,
                 f"# Query\n\n{query}\n\n"
                 f"# Source\n\n{chunk['source']}\n\n"
                 f"# Chunk\n\n{chunk['text']}\n"
@@ -43,13 +50,21 @@ def rag_token_budget(ctx_size: int) -> int:
 
 
 def count_tokens(text: str, server_url: str = SERVER_URL) -> int:
-    r = httpx.post(
+    if server_url == SERVER_URL and text in _token_count_cache:
+        return _token_count_cache[text]
+
+    r = post_with_retries(
         f"{server_url}/tokenize",
         json={"content": text},
         timeout=LLM_TOKENIZE_TIMEOUT_SECONDS,
     )
     r.raise_for_status()
-    return len(r.json().get("tokens", []))
+    token_count = len(r.json().get("tokens", []))
+    if server_url == SERVER_URL:
+        if len(_token_count_cache) >= _TOKEN_CACHE_MAX_ITEMS:
+            _token_count_cache.clear()
+        _token_count_cache[text] = token_count
+    return token_count
 
 
 def _rag_char_budget_fallback(ctx_size: int) -> int:
@@ -67,15 +82,17 @@ def _format_chunk_for_context(chunk: dict) -> str:
 
 
 def _pack_chunks_by_tokens(
-    chunks: list[dict], ctx_size: int
+    chunks: list[dict], ctx_size: int, max_tokens: int | None = None
 ) -> tuple[list[str], int]:
-    max_tokens = rag_token_budget(ctx_size)
+    max_tokens = rag_token_budget(ctx_size) if max_tokens is None else max_tokens
+    if max_tokens <= 0:
+        return [], 0
     separator = "\n\n---\n\n"
     try:
         sep_tokens = count_tokens(separator)
     except Exception as e:
         log("RAG", f"Tokenizer unavailable ({e}); falling back to char budget")
-        return _pack_chunks_by_chars(chunks, _rag_char_budget_fallback(ctx_size))
+        return _pack_chunks_by_chars(chunks, max_tokens * 3)
 
     entries: list[str] = []
     total = 0
@@ -85,7 +102,9 @@ def _pack_chunks_by_tokens(
             entry_tokens = count_tokens(entry)
         except Exception as e:
             log("RAG", f"Tokenizer failed mid-pack ({e}); falling back to char budget")
-            return _pack_chunks_by_chars(chunks, _rag_char_budget_fallback(ctx_size))
+            return _pack_chunks_by_chars(chunks, max_tokens * 3)
+        if not entries and entry_tokens > max_tokens:
+            break
         if entries and total + entry_tokens + sep_tokens > max_tokens:
             break
         entries.append(entry)
@@ -94,6 +113,8 @@ def _pack_chunks_by_tokens(
 
 
 def _pack_chunks_by_chars(chunks: list[dict], max_chars: int) -> tuple[list[str], int]:
+    if max_chars <= 0:
+        return [], 0
     entries: list[str] = []
     total = 0
     for chunk in chunks:
@@ -109,7 +130,7 @@ def _compress_rag_context(query: str, context: str) -> str:
     if not context.strip():
         return context
 
-    response = httpx.post(
+    response = post_with_retries(
         f"{SERVER_URL}/v1/chat/completions",
         json={
             "model": "local",
@@ -138,7 +159,7 @@ def _modify_retrieval_query(query: str) -> str:
     if not query.strip():
         return query
 
-    response = httpx.post(
+    response = post_with_retries(
         f"{SERVER_URL}/v1/chat/completions",
         json={
             "model": "local",
@@ -164,7 +185,7 @@ def _rephrase_retrieval_query(query: str) -> str:
     if not query.strip():
         return query
 
-    response = httpx.post(
+    response = post_with_retries(
         f"{SERVER_URL}/v1/chat/completions",
         json={
             "model": "local",
@@ -190,7 +211,7 @@ def _generate_hyde_query(query: str) -> str:
     if not query.strip():
         return query
 
-    response = httpx.post(
+    response = post_with_retries(
         f"{SERVER_URL}/v1/chat/completions",
         json={
             "model": "local",
@@ -224,7 +245,9 @@ def _build_hyde_retrieval_query(
     return f"{retrieval_query} {hyde_excerpt.strip()}"
 
 
-def _retrieve_rag_context(history: list[dict]) -> tuple[str, bool]:
+def _retrieve_rag_context(
+    history: list[dict], token_budget: int | None = None
+) -> tuple[str, bool]:
     log("RAG", "Retrieving context from knowledge base...")
     try:
         from core.knowledge_base import list_indexed_documents, retrieve
@@ -250,8 +273,12 @@ def _retrieve_rag_context(history: list[dict]) -> tuple[str, bool]:
 
         _dump_chunks_for_debug(query, results)
 
-        ctx_size = load_ctx_size() or 8192
-        sections, total = _pack_chunks_by_tokens(results, ctx_size)
+        ctx_size = load_ctx_size(get_current_model_path()) or 8192
+        sections, total = _pack_chunks_by_tokens(
+            results,
+            ctx_size,
+            max_tokens=token_budget,
+        )
 
         context = "\n\n---\n\n".join(sections)
         raw_length = len(context)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from config import DATA_DIR
 from core.logger import log
+from core.security import read_protected_json, write_protected_json
 
 CHATS_DIR = DATA_DIR / "chats"
 CHATS_DIR.mkdir(parents=True, exist_ok=True)
@@ -34,7 +35,7 @@ def list_chats() -> list[dict]:
     chats = []
     for path in CHATS_DIR.glob("*.json"):
         try:
-            data = json.loads(path.read_text())
+            data = read_protected_json(path)
             chats.append({k: v for k, v in data.items() if k != "history"})
         except json.JSONDecodeError:
             log("CHAT", f"Corrupted chat file, skipping: {path.name}")
@@ -47,7 +48,7 @@ def load_chat(chat_id: str) -> dict | None:
     path = _chat_path(chat_id)
     if path.exists():
         try:
-            return json.loads(path.read_text())
+            return read_protected_json(path)
         except json.JSONDecodeError:
             log("CHAT", f"Corrupted chat file: {path.name}")
         except OSError as e:
@@ -57,7 +58,7 @@ def load_chat(chat_id: str) -> dict | None:
 
 def save_chat(chat: dict) -> None:
     chat["updated_at"] = datetime.now(UTC).isoformat()
-    _chat_path(chat["id"]).write_text(json.dumps(chat, ensure_ascii=False, indent=2))
+    write_protected_json(_chat_path(chat["id"]), chat)
 
 
 def delete_chat(chat_id: str) -> None:

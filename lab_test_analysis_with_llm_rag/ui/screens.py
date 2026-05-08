@@ -5,19 +5,22 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
+    QScrollArea,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from config import ICONS_DIR
+from ui.biomarkers import TrendsContent
 from ui.components import profile_scroll_area
 from ui.documents.view import DocumentsHubWidget
 from ui.health_report import HealthReportContent
-from ui.model_hub_widget import ModelHubWidget
-from ui.profile_dialog import ProfileForm
-from ui.settings_dialog import SettingsForm
+from ui.models.hub_widget import ModelHubWidget
+from ui.onboarding.view import _NAV_BTN_SIZE
+from ui.profile.form import ProfileForm
+from ui.sections import SectionNames
+from ui.settings import SettingsForm
 
 # ── Home ───────────────────────────────────────────────────────────────────
 
@@ -95,7 +98,8 @@ class HomeScreen(QWidget):
     DOCUMENTS_INDEX = 2
     CHAT_INDEX = 3
     HEALTH_REPORT_INDEX = 4
-    SETTINGS_INDEX = 5
+    TRENDS_INDEX = 5
+    SETTINGS_INDEX = 6
 
     def __init__(self, *, chat_widget: QWidget, build_profile_context, parent=None):
         super().__init__(parent)
@@ -143,33 +147,51 @@ class HomeScreen(QWidget):
         self.health_report = HealthReportContent(build_profile_context)
         self._stack.addWidget(self.health_report)
 
+        # Trends content.
+        self.trends = TrendsContent()
+        self._stack.addWidget(self.trends)
+
         # Settings content.
         self._settings_form = SettingsForm()
+        self._settings_form.reindex_requested.connect(self.documents.reindex_files)
         self._stack.addWidget(self._build_settings_content(self._settings_form))
 
         # ── Tiles ──
+        # Labels come from ui.sections.SectionNames so a rename in one
+        # place propagates to the sidebar tiles, Settings block headers,
+        # and any other place that names a section.
         tiles_def = [
-            ("My Profile", "profile.png", self.PROFILE_INDEX),
-            ("Models", "model_hub.png", self.MODEL_HUB_INDEX),
-            ("Medical Documents", "documents.png", self.DOCUMENTS_INDEX),
-            ("Chat with Documents", "chat_with_documents.png", self.CHAT_INDEX),
-            ("Health Report", "health_report.png", self.HEALTH_REPORT_INDEX),
+            (SectionNames.PROFILE, "profile.png", self.PROFILE_INDEX),
+            (SectionNames.MODELS, "model_hub.png", self.MODEL_HUB_INDEX),
+            (SectionNames.MEDICAL_DOCUMENTS, "documents.png", self.DOCUMENTS_INDEX),
+            (SectionNames.CHAT_WITH_DOCUMENTS, "chat_with_documents.png", self.CHAT_INDEX),
+            (SectionNames.HEALTH_REPORT, "health_report.png", self.HEALTH_REPORT_INDEX),
+            (SectionNames.TRENDS, "trends.png", self.TRENDS_INDEX),
         ]
-        # Equal stretches between every pair of tiles so all gaps grow
-        # proportionally — Settings stays at the bottom but its lead-in
-        # space matches the gaps between the other tiles.
         self._tiles: list[_SidebarTile] = []
-        for i, (label, icon, idx) in enumerate(tiles_def):
-            if i > 0:
-                sidebar_layout.addStretch(1)
+
+        tiles_wrap = QWidget()
+        tiles_layout = QVBoxLayout(tiles_wrap)
+        tiles_layout.setContentsMargins(0, 0, 0, 0)
+        tiles_layout.setSpacing(6)
+
+        for label, icon, idx in tiles_def:
             tile = _SidebarTile(label, icon)
             tile.clicked.connect(lambda _checked=False, i=idx: self.activate(i))
-            sidebar_layout.addWidget(tile, alignment=Qt.AlignmentFlag.AlignHCenter)
+            tiles_layout.addWidget(tile, alignment=Qt.AlignmentFlag.AlignHCenter)
             self._tiles.append(tile)
+        tiles_layout.addStretch(1)
 
-        sidebar_layout.addStretch(1)
+        tiles_scroll = QScrollArea()
+        tiles_scroll.setObjectName("sidebarTilesScroll")
+        tiles_scroll.setWidgetResizable(True)
+        tiles_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        tiles_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tiles_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tiles_scroll.setWidget(tiles_wrap)
+        sidebar_layout.addWidget(tiles_scroll, stretch=1)
 
-        settings_tile = _SidebarTile("Settings", "settings.png")
+        settings_tile = _SidebarTile(SectionNames.SETTINGS, "settings.png")
         settings_tile.clicked.connect(
             lambda _checked=False: self.activate(self.SETTINGS_INDEX)
         )
@@ -181,26 +203,31 @@ class HomeScreen(QWidget):
 
         self.activate(self.PROFILE_INDEX)
 
+    def _build_save_row(self, save_btn: QPushButton) -> QHBoxLayout:
+        save_btn.setFixedSize(*_NAV_BTN_SIZE)
+
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        row.addStretch()
+
+        spacer = QWidget()
+        spacer.setFixedSize(*_NAV_BTN_SIZE)
+        row.addWidget(spacer)
+        row.addWidget(save_btn)
+        return row
+
     def _build_settings_content(self, form: SettingsForm) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setContentsMargins(40, 40, 40, 40)
         layout.setSpacing(16)
 
         form.setMinimumWidth(380)
         form.setMaximumWidth(560)
 
         save_btn = QPushButton("Save")
-        save_btn.setFixedHeight(40)
-        save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        save_btn.setObjectName("settingsSaveButton")
         save_btn.clicked.connect(form.save)
-
-        save_row = QWidget()
-        save_layout = QHBoxLayout(save_row)
-        save_layout.setContentsMargins(0, 0, 0, 0)
-        save_layout.setSpacing(8)
-        save_layout.addStretch(1)
-        save_layout.addWidget(save_btn, stretch=1)
 
         form_column = QWidget()
         form_column.setMinimumWidth(380)
@@ -209,21 +236,22 @@ class HomeScreen(QWidget):
         column_layout.setContentsMargins(0, 0, 0, 0)
         column_layout.setSpacing(16)
         column_layout.addWidget(form)
-        column_layout.addWidget(save_row)
 
         form_wrap = QHBoxLayout()
         form_wrap.addStretch()
         form_wrap.addWidget(form_column)
         form_wrap.addStretch()
-        layout.addLayout(form_wrap)
 
-        layout.addStretch()
+        form_container = QWidget()
+        form_container.setLayout(form_wrap)
+        layout.addWidget(profile_scroll_area(form_container), stretch=1)
+        layout.addLayout(self._build_save_row(save_btn))
         return wrap
 
     def _build_profile_content(self, form: ProfileForm) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setContentsMargins(40, 40, 40, 40)
         layout.setSpacing(16)
 
         form_wrap = QHBoxLayout()
@@ -232,17 +260,9 @@ class HomeScreen(QWidget):
         form.setMaximumWidth(560)
 
         save_btn = QPushButton("Save")
-        save_btn.setFixedHeight(40)
-        save_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        save_btn.setObjectName("profileSaveButton")
         save_btn.clicked.connect(form.save)
 
-        save_row = QWidget()
-        save_layout = QHBoxLayout(save_row)
-        save_layout.setContentsMargins(0, 0, 0, 0)
-        save_layout.setSpacing(8)
-        save_layout.addStretch(1)
-        save_layout.addWidget(save_btn, stretch=1)
-        form.form.addRow("", save_row)
         form.submitted.connect(form.save)
 
         form_wrap.addWidget(form)
@@ -251,6 +271,7 @@ class HomeScreen(QWidget):
         form_container = QWidget()
         form_container.setLayout(form_wrap)
         layout.addWidget(profile_scroll_area(form_container), stretch=1)
+        layout.addLayout(self._build_save_row(save_btn))
         return wrap
 
     def activate(self, index: int) -> None:
@@ -263,6 +284,13 @@ class HomeScreen(QWidget):
             self.model_hub.refresh_local()
         elif index == self.HEALTH_REPORT_INDEX:
             self.health_report.refresh()
+        elif index == self.TRENDS_INDEX:
+            self.trends.refresh()
+        elif index == self.SETTINGS_INDEX:
+            # Rebuild model-dependent fields (Context Window dropdown) so a
+            # model swap that happened after the form was first built shows
+            # up with the live model's max ctx, not the stale one.
+            self._settings_form.reload()
 
     def show_profile(self) -> None:
         self.activate(self.PROFILE_INDEX)

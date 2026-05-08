@@ -1,94 +1,39 @@
-"""HuggingFace model hub client for browsing and downloading GGUF models."""
+"""Approved HuggingFace model downloader."""
 
-import json
-import urllib.error
+import socket
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from config import (
     ALLOW_ALL_MODEL_DOWNLOADS,
     ALLOWED_DOWNLOAD_MODEL_IDS,
-    DEFAULT_MMPROJ_FILE,
-    DEFAULT_MMPROJ_LOCAL,
-    DEFAULT_MODEL_FILE,
-    DEFAULT_MODEL_REPO,
+    APPROVED_MODELS,
     MODELS_DIR,
+    approved_model_file_path,
+    get_default_model,
 )
 from core.logger import log
 
-HF_API = "https://huggingface.co/api"
 HF_BASE = "https://huggingface.co"
 
-
-def search_models(query: str, limit: int = 20) -> list[dict]:
-    """Search HuggingFace for models that actually contain GGUF files.
-
-    The HF `filter=gguf` tag is loose — some tagged repos hold only
-    safetensors. We post-filter by listing each repo's tree in parallel and
-    dropping any that has zero `.gguf` files, so non-runnable repos never
-    reach the UI. Results are then filtered against the curated
-    ALLOWED_DOWNLOAD_MODEL_IDS list — only approved repos are surfaced.
-    """
-    params = urllib.parse.urlencode(
-        {
-            "search": query,
-            "filter": "gguf",
-            "sort": "downloads",
-            "direction": "-1",
-            "limit": str(limit),
-        }
-    )
-    url = f"{HF_API}/models?{params}"
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-
-    allow = set(ALLOWED_DOWNLOAD_MODEL_IDS)
-    candidates = [
-        {
-            "id": m.get("id", ""),
-            "author": m.get("author", ""),
-            "downloads": m.get("downloads", 0),
-            "likes": m.get("likes", 0),
-            "last_modified": m.get("lastModified", ""),
-        }
-        for m in data
-        if ALLOW_ALL_MODEL_DOWNLOADS or m.get("id", "") in allow
-    ]
-
-    def _has_gguf(model_id: str) -> bool:
-        try:
-            return bool(list_gguf_files(model_id))
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            log("HUB", f"Dropping {model_id} (tree fetch failed: {e})")
-            return False
-
-    with ThreadPoolExecutor(max_workers=10) as pool:
-        flags = list(pool.map(_has_gguf, [c["id"] for c in candidates]))
-
-    filtered = [c for c, ok in zip(candidates, flags, strict=True) if ok]
-    log(
-        "HUB",
-        f"search_models: {len(data)} HF results -> {len(candidates)} allowed -> "
-        f"{len(filtered)} with GGUF files",
-    )
-    return filtered
+# Socket timeout for the HF download connection. urllib reuses this for
+# both connect and per-read, so a TCP stall (no bytes received for this
+# many seconds) raises socket.timeout instead of hanging forever. 60s is
+# generous enough for slow links to receive at least one chunk.
+_HF_SOCKET_TIMEOUT = 60
 
 
-def list_gguf_files(model_id: str) -> list[dict]:
-    """List .gguf files in a model repo with their sizes."""
-    url = f"{HF_API}/models/{model_id}/tree/main"
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        data = json.loads(resp.read().decode())
-
-    files = [
-        {"name": item.get("path", ""), "size": item.get("size", 0)}
-        for item in data
-        if item.get("path", "").endswith(".gguf")
-    ]
-    return sorted(files, key=lambda f: f["size"])
+def _approved_filenames(model_id: str) -> set[str]:
+    filenames: set[str] = set()
+    for model in APPROVED_MODELS.values():
+        if model["repo_id"] != model_id:
+            continue
+        filenames.add(model["model_file"])
+        if mmproj_file := model.get("mmproj_file"):
+            filenames.add(mmproj_file)
+    return filenames
 
 
 def download_model(
@@ -96,6 +41,7 @@ def download_model(
     filename: str,
     on_progress: Callable[[int, int], None] | None = None,
     stop_event=None,
+    download_dir: Path | None = None,
 ) -> Path:
     """Download a GGUF file from HuggingFace to MODELS_DIR.
 
@@ -115,13 +61,19 @@ def download_model(
         raise PermissionError(
             f"Model {model_id!r} is not on the approved download allowlist."
         )
+    if not ALLOW_ALL_MODEL_DOWNLOADS and filename not in _approved_filenames(model_id):
+        raise PermissionError(
+            f"File {filename!r} is not approved for model {model_id!r}."
+        )
 
     url = f"{HF_BASE}/{model_id}/resolve/main/{urllib.parse.quote(filename)}"
-    dest = MODELS_DIR / filename
+    dest_dir = download_dir or MODELS_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / filename
     tmp = dest.with_suffix(".gguf.part")
 
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with urllib.request.urlopen(url, timeout=_HF_SOCKET_TIMEOUT) as resp:
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
 
@@ -130,13 +82,31 @@ def download_model(
                     if stop_event and stop_event.is_set():
                         raise InterruptedError("Download cancelled")
 
-                    chunk = resp.read(1024 * 1024)
+                    try:
+                        chunk = resp.read(1024 * 1024)
+                    except (TimeoutError, socket.timeout) as e:
+                        raise OSError(
+                            f"Download of {filename} timed out after "
+                            f"{_HF_SOCKET_TIMEOUT}s of no data — please retry."
+                        ) from e
                     if not chunk:
                         break
                     f.write(chunk)
                     downloaded += len(chunk)
                     if on_progress:
                         on_progress(downloaded, total)
+
+        # Integrity check: a dropped connection ends the read loop with
+        # `chunk = b""` and exits silently. Without this guard, a partial
+        # file would get renamed to the final destination — and llama.cpp
+        # later fails with "failed to seek for tensor X" when the truncated
+        # GGUF is loaded. Verify byte count matches Content-Length.
+        if total > 0 and downloaded < total:
+            raise OSError(
+                f"Download of {filename} truncated: got {downloaded} of "
+                f"{total} bytes. The connection likely dropped — please "
+                f"retry the download."
+            )
 
         tmp.rename(dest)
         return dest
@@ -154,21 +124,25 @@ def ensure_default_model(
 
     Returns the path to the main model file.
     """
-    model_path = MODELS_DIR / DEFAULT_MODEL_FILE
-    mmproj_path = MODELS_DIR / DEFAULT_MMPROJ_LOCAL
+    model = get_default_model()
+    model_path = approved_model_file_path(model)
+    mmproj_file = model["mmproj_file"]
+    mmproj_local = model["mmproj_local"]
+    mmproj_path = approved_model_file_path(model, mmproj_local)
 
     files_to_download = []
     if not model_path.exists():
-        files_to_download.append((DEFAULT_MODEL_FILE, DEFAULT_MODEL_FILE))
+        files_to_download.append((model["model_file"], model["model_file"]))
     if not mmproj_path.exists():
-        files_to_download.append((DEFAULT_MMPROJ_FILE, DEFAULT_MMPROJ_LOCAL))
+        files_to_download.append((mmproj_file, mmproj_local))
 
     if not files_to_download:
         log("HUB", "Default model files already present")
         return str(model_path)
 
     for hf_name, local_name in files_to_download:
-        dest = MODELS_DIR / local_name
+        dest = approved_model_file_path(model, local_name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
         if on_progress:
             on_progress(f"Downloading {local_name}...")
 
@@ -179,16 +153,16 @@ def ensure_default_model(
 
         log("HUB", f"Downloading {hf_name} -> {local_name}")
         download_model(
-            DEFAULT_MODEL_REPO,
+            model["repo_id"],
             hf_name,
             on_progress=_report,
             stop_event=stop_event,
+            download_dir=dest.parent,
         )
         # Rename if HF filename differs from local name
-        if hf_name != local_name:
-            downloaded_path = MODELS_DIR / hf_name
-            if downloaded_path.exists():
-                downloaded_path.rename(dest)
+        downloaded_path = dest.parent / hf_name
+        if downloaded_path.exists() and downloaded_path != dest:
+            downloaded_path.rename(dest)
 
     log("HUB", "Default model files ready")
     return str(model_path)

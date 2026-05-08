@@ -1,6 +1,6 @@
-import shutil
+from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
@@ -22,7 +22,10 @@ from core.health_report import (
     new_documents_since_last_report,
     report_exists,
 )
+from core.security import read_protected_bytes, read_protected_text
 from ui.health_report.workers import HealthReportWorker
+
+_ACTION_BUTTON_SIZE = (100, 38)
 
 
 def _format_time(seconds: float) -> str:
@@ -47,6 +50,9 @@ class HealthReportContent(QWidget):
         self._token_max = 0
         self._gen_start_monotonic: float | None = None
         self._mode_label = ""
+        self._loaded_pdf_mtime_ns: int | None = None
+        self._pdf_bytes: QByteArray | None = None
+        self._pdf_buffer: QBuffer | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -55,13 +61,13 @@ class HealthReportContent(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self._generate_btn = QPushButton("Generate")
-        self._generate_btn.setFixedSize(120, 38)
+        self._generate_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
         self._generate_btn.clicked.connect(lambda: self._kick_off("full"))
         btn_row.addWidget(self._generate_btn)
 
         self._update_btn = QPushButton("Update")
         self._update_btn.setObjectName("attachButton")
-        self._update_btn.setFixedSize(120, 38)
+        self._update_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
         self._update_btn.clicked.connect(lambda: self._kick_off("update"))
         btn_row.addWidget(self._update_btn)
 
@@ -69,13 +75,13 @@ class HealthReportContent(QWidget):
 
         self._download_btn = QPushButton("Download")
         self._download_btn.setObjectName("attachButton")
-        self._download_btn.setFixedSize(120, 38)
+        self._download_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
         self._download_btn.clicked.connect(self._download)
         btn_row.addWidget(self._download_btn)
 
         self._delete_btn = QPushButton("Delete")
-        self._delete_btn.setObjectName("attachButton")
-        self._delete_btn.setFixedSize(120, 38)
+        self._delete_btn.setObjectName("stopButton")
+        self._delete_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
         self._delete_btn.clicked.connect(self._delete)
         btn_row.addWidget(self._delete_btn)
 
@@ -122,7 +128,8 @@ class HealthReportContent(QWidget):
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._empty_label, stretch=1)
 
-        self.refresh()
+        self._pdf_view.setVisible(False)
+        self._update_button_states()
 
     def refresh(self) -> None:
         self._reload_pdf()
@@ -157,7 +164,7 @@ class HealthReportContent(QWidget):
             if not doc_names:
                 self._set_busy(False)
                 return
-            existing_md = HEALTH_REPORT_MD.read_text(encoding="utf-8")
+            existing_md = read_protected_text(HEALTH_REPORT_MD)
         else:
             doc_names = list_uploaded_documents()
             existing_md = ""
@@ -193,6 +200,8 @@ class HealthReportContent(QWidget):
         if self._is_busy() or not report_exists():
             return
         self._pdf_doc.close()
+        self._close_pdf_buffer()
+        self._loaded_pdf_mtime_ns = None
         delete_report()
         self._status_label.setText("Report deleted.")
         self.refresh()
@@ -205,7 +214,8 @@ class HealthReportContent(QWidget):
         )
         if dest:
             try:
-                shutil.copy2(HEALTH_REPORT_PDF, dest)
+                dest_path = Path(dest)
+                dest_path.write_bytes(read_protected_bytes(HEALTH_REPORT_PDF))
                 self._status_label.setText(f"Saved to {dest}")
             except OSError as e:
                 self._status_label.setText(f"Save failed: {e}")
@@ -275,11 +285,27 @@ class HealthReportContent(QWidget):
 
     def _reload_pdf(self) -> None:
         if HEALTH_REPORT_PDF.exists():
-            self._pdf_doc.close()
-            self._pdf_doc.load(str(HEALTH_REPORT_PDF))
+            mtime_ns = HEALTH_REPORT_PDF.stat().st_mtime_ns
+            if self._loaded_pdf_mtime_ns != mtime_ns:
+                self._pdf_doc.close()
+                self._close_pdf_buffer()
+                self._pdf_bytes = QByteArray(read_protected_bytes(HEALTH_REPORT_PDF))
+                self._pdf_buffer = QBuffer(self._pdf_bytes, self)
+                self._pdf_buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+                self._pdf_doc.load(self._pdf_buffer)
+                self._loaded_pdf_mtime_ns = mtime_ns
             self._pdf_view.setVisible(True)
             self._empty_label.setVisible(False)
         else:
             self._pdf_doc.close()
+            self._close_pdf_buffer()
+            self._loaded_pdf_mtime_ns = None
             self._pdf_view.setVisible(False)
             self._empty_label.setVisible(True)
+
+    def _close_pdf_buffer(self) -> None:
+        if self._pdf_buffer is not None:
+            self._pdf_buffer.close()
+            self._pdf_buffer.deleteLater()
+        self._pdf_buffer = None
+        self._pdf_bytes = None

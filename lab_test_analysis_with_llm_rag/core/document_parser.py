@@ -10,7 +10,6 @@ import json
 import re
 from pathlib import Path
 
-import httpx
 from PIL import Image
 
 from config import (
@@ -21,7 +20,9 @@ from config import (
     PARSER_SANITIZE_TIMEOUT_SECONDS,
     PARSER_VISION_TIMEOUT_SECONDS,
 )
+from core.http_client import post_with_retries
 from core.logger import log
+from core.security import write_protected_text
 
 Image.MAX_IMAGE_PIXELS = None  # Allow high-res medical scans
 
@@ -142,7 +143,7 @@ def _extract_single_page(
             ],
         }
     ]
-    response = httpx.post(
+    response = post_with_retries(
         f"{server_url}/v1/chat/completions",
         json={
             "model": "local",
@@ -193,7 +194,7 @@ def _extract_text_via_vision(images: list[Image.Image], server_url: str) -> str:
 def _sanitize_text(text: str, server_url: str) -> str:
     """Remove administrative noise from parsed text while preserving clinical data."""
     log("PARSER", f"Sanitizing parsed text ({len(text)} chars)")
-    response = httpx.post(
+    response = post_with_retries(
         f"{server_url}/v1/chat/completions",
         json={
             "model": "local",
@@ -228,7 +229,7 @@ def _normalize_report_date(value: str) -> str:
 def extract_document_metadata(text: str, server_url: str) -> dict[str, str]:
     """Extract report metadata from parsed text."""
     log("PARSER", f"Extracting document metadata ({len(text)} chars)")
-    response = httpx.post(
+    response = post_with_retries(
         f"{server_url}/v1/chat/completions",
         json={
             "model": "local",
@@ -308,7 +309,7 @@ def parse_document(file_path: str | Path, server_url: str) -> str:
     raw_text = text
     if _RAW_SAVE_DIR:
         raw_save_path = _RAW_SAVE_DIR / f"{stem}.md"
-        raw_save_path.write_text(raw_text, encoding="utf-8")
+        write_protected_text(raw_save_path, raw_text)
         log("PARSER", f"Saved raw parsing result to {raw_save_path}")
 
     try:
@@ -318,7 +319,7 @@ def parse_document(file_path: str | Path, server_url: str) -> str:
 
     if _FILTERED_SAVE_DIR:
         filtered_save_path = _FILTERED_SAVE_DIR / f"{stem}.md"
-        filtered_save_path.write_text(text, encoding="utf-8")
+        write_protected_text(filtered_save_path, text)
         log("PARSER", f"Saved filtered parsing result to {filtered_save_path}")
 
     return text

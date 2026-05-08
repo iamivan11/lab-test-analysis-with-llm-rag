@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 from config import (
     APP_NAME,
+    DOCS_DIR,
     is_onboarding_complete,
     save_model_path,
     set_onboarding_complete,
@@ -19,6 +20,11 @@ from config import (
 from core.chat_store import list_chats, load_chat, new_chat
 from core.llm_engine import stop_server
 from core.logger import log
+from core.security import (
+    SecurityError,
+    migrate_known_sensitive_files,
+    unlock,
+)
 from ui.chat import ChatController
 from ui.chat.widgets import AutoHideScrollListWidget, ChatDisplayBrowser, PlainTextPasteEdit
 from ui.documents import DocumentsController
@@ -31,15 +37,73 @@ from ui.onboarding import (
 )
 from ui.profile import ProfileController
 from ui.screens import HomeScreen
+from ui.security_unlock import UnlockScreen
 from ui.styles import STYLESHEET
 
 
+def _is_worker_running(worker) -> bool:
+    if worker is None:
+        return False
+    try:
+        return bool(worker.isRunning())
+    except RuntimeError:
+        return False
+
+
+def _request_worker_stop(worker) -> None:
+    stop = getattr(worker, "stop", None)
+    if callable(stop):
+        stop()
+
+
+def _wait_worker_stopped(label: str, worker, timeout_ms: int = 3000) -> bool:
+    if not _is_worker_running(worker):
+        return True
+    if worker.wait(timeout_ms):
+        return True
+    log("UI", f"Worker still running during shutdown: {label}")
+    return False
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    SHUTDOWN_WAIT_MS = 3000
+    SHUTDOWN_RETRY_MS = 250
+
+    def __init__(self, *, start_locked: bool = False):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(900, 600)
         self.setStyleSheet(STYLESHEET)
+        self._app_initialized = False
+
+        if start_locked:
+            self._show_unlock_screen()
+        else:
+            self._init_app_ui()
+
+    def _show_unlock_screen(self) -> None:
+        self._unlock_screen = UnlockScreen()
+        self._unlock_screen.unlock_requested.connect(self._unlock_and_initialize)
+        self.setCentralWidget(self._unlock_screen)
+        QTimer.singleShot(0, self._unlock_screen.focus_password)
+        log("APP", "Unlock screen shown")
+
+    def _unlock_and_initialize(self, password: str) -> None:
+        try:
+            unlock(password)
+            from config import migrate_profile_to_protected_file
+
+            migrate_profile_to_protected_file()
+            migrate_known_sensitive_files()
+            log("APP", "Protected data unlocked")
+            self._init_app_ui()
+        except SecurityError:
+            self._unlock_screen.show_error("Password is incorrect.")
+
+    def _init_app_ui(self) -> None:
+        if self._app_initialized:
+            return
+        self._app_initialized = True
 
         self._history: list[dict] = []
         self._current_chat: dict = new_chat()
@@ -57,10 +121,13 @@ class MainWindow(QMainWindow):
         self._pending_prompt = ""
         self._compression_attempted = False
         self._generation_stopped = False
+        self._generation_token = 0
+        self._compression_token = 0
         self._parsing_active = False
         self._download_worker = None
         self._load_token = 0
         self._hovered_link_range = None
+        self._shutdown_retry_scheduled = False
 
         # Hidden stub kept for compat with ModelController which toggles it.
         self._model_btn = QPushButton()
@@ -115,12 +182,18 @@ class MainWindow(QMainWindow):
         self._documents_setup_screen.docs.parsing_active_changed.connect(
             self._on_parsing_active_changed
         )
+        self._documents_setup_screen.docs.docs_changed.connect(self._update_use_docs_state)
 
         # Home-embedded sections.
         self._home_screen.documents.model_swapped.connect(self._on_docs_model_swapped)
         self._home_screen.documents.parsing_active_changed.connect(self._on_parsing_active_changed)
+        self._home_screen.documents.docs_changed.connect(self._update_use_docs_state)
         self._home_screen.model_hub.load_requested.connect(self._on_hub_load_requested)
         self._home_screen.model_hub.loaded_model_deleted.connect(self._ensure_default_model)
+        self._home_screen._settings_form.user_data_cleared.connect(self._on_user_data_cleared)
+        self._home_screen._settings_form.default_model_changed.connect(
+            self._on_default_model_changed
+        )
 
     def _show_welcome(self):
         self._stack.setCurrentWidget(self._welcome_screen)
@@ -141,8 +214,11 @@ class MainWindow(QMainWindow):
     def _on_documents_setup_proceed(self):
         if self._documents_setup_screen.docs.is_busy():
             return
-        set_onboarding_complete(True)
         self._show_home()
+        QTimer.singleShot(0, self._mark_onboarding_complete)
+
+    def _mark_onboarding_complete(self) -> None:
+        set_onboarding_complete(True)
 
     def _show_home(self):
         # Resetting Home to its default tile (Profile) keeps the Back button
@@ -156,6 +232,49 @@ class MainWindow(QMainWindow):
         self._load_model(model_path)
         self._home_screen.show_chat()
 
+    def _on_default_model_changed(self, model_id: str) -> None:
+        """Settings → Default Model was changed and saved. Switch the
+        running llama-server to the newly-chosen default."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from config import APPROVED_MODELS, approved_model_file_path
+        from core.llm_engine import get_current_model_path
+
+        model = APPROVED_MODELS.get(model_id)
+        if not model:
+            log("UI", f"Unknown default model id: {model_id}")
+            return
+        target_path = approved_model_file_path(model)
+        if not target_path.exists():
+            # Modal so the user sees this even while on the Settings tile;
+            # writing to the chat top-bar status label would be invisible
+            # from here.
+            log("UI", f"Default model {model_id} not yet downloaded at {target_path}")
+            QMessageBox.warning(
+                self,
+                "Model not installed",
+                f"{model['display_name']} isn't downloaded yet. "
+                "Open the Models tab and install it to use it as the default.",
+            )
+            return
+        if get_current_model_path() == str(target_path):
+            log("UI", f"Default model {model_id} already loaded — no reload")
+            return
+        log("UI", f"Switching to new default model {model_id} at {target_path}")
+        save_model_path(str(target_path))
+        self._load_model(str(target_path))
+
+    def _on_user_data_cleared(self) -> None:
+        self._current_chat = new_chat()
+        self._history = []
+        self._chat_display.clear()
+        self._chat_search.clear()
+        self._refresh_chat_list()
+        self._home_screen.documents._refresh_list()
+        self._home_screen.health_report.refresh()
+        self._home_screen.trends.refresh()
+        self._update_use_docs_state()
+
     # ── Chat screen build ──────────────────────────────────────────────────
 
     def _build_chat_screen(self) -> QWidget:
@@ -168,7 +287,7 @@ class MainWindow(QMainWindow):
         # --- Sidebar ---
         self._sidebar = QWidget()
         self._sidebar.setObjectName("sidebar")
-        self._sidebar.setFixedWidth(260)
+        self._sidebar.setFixedWidth(220)
         sidebar_layout = QVBoxLayout(self._sidebar)
         sidebar_layout.setContentsMargins(12, 16, 12, 16)
         sidebar_layout.setSpacing(8)
@@ -232,6 +351,19 @@ class MainWindow(QMainWindow):
         self._cpu_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_row.addWidget(self._cpu_chip)
 
+        # Context window utilization (history tokens / configured n_ctx).
+        # Lives in the slack to the right of the resource chips so it
+        # tells the user how much room they have left to keep chatting.
+        self._ctx_chip = QLabel("Context: --")
+        self._ctx_chip.setStyleSheet(chip_style)
+        self._ctx_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._ctx_chip.setToolTip(
+            "Approximate context-window usage: history tokens / configured "
+            "context size. Increase Context Window in Settings if you're "
+            "running out."
+        )
+        top_row.addWidget(self._ctx_chip)
+
         top_row.addStretch()
 
         main_layout.addLayout(top_row)
@@ -241,6 +373,7 @@ class MainWindow(QMainWindow):
         self._stats_timer = QTimer(self)
         self._stats_timer.timeout.connect(self._update_stats)
         self._stats_timer.start(2000)
+        self._update_ctx_chip()
         self._update_stats()
 
         # Chat display
@@ -278,16 +411,46 @@ class MainWindow(QMainWindow):
         self._send_btn.clicked.connect(self._send_message)
         btn_column.addWidget(self._send_btn)
 
-        input_row.addWidget(btn_widget)
-
         input_height = BTN_H * 2 + BTN_SPACING
         self._input_field = PlainTextPasteEdit()
         self._input_field.setPlaceholderText("Type your message...")
         self._input_field.setFixedHeight(input_height)
+        self._input_field.setViewportMargins(0, 0, 104, 0)
+
+        self._use_docs_btn = QPushButton("Use Docs", self._input_field)
+        self._use_docs_btn.setObjectName("useDocsButton")
+        self._use_docs_btn.setCheckable(True)
+        self._use_docs_btn.setChecked(True)
+        self._use_docs_btn.setFixedSize(92, 28)
+        self._use_docs_btn.setToolTip("Use uploaded documents when answering")
+        self._use_docs_btn.setStyleSheet(
+            """
+            QPushButton#useDocsButton {
+                background-color: #313244;
+                color: #6c7086;
+                border: 1px solid #45475a;
+                border-radius: 8px;
+                padding: 2px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton#useDocsButton:enabled:hover {
+                background-color: #45475a;
+            }
+            QPushButton#useDocsButton:enabled:checked {
+                color: #cdd6f4;
+                border-color: #89b4fa;
+            }
+            """
+        )
+        self._update_use_docs_state()
+
+        input_row.addWidget(btn_widget)
         self._input_field.installEventFilter(self)
         self._chat_display.viewport().setMouseTracking(True)
         self._chat_display.viewport().installEventFilter(self)
         input_row.addWidget(self._input_field, stretch=1)
+        QTimer.singleShot(0, self._position_use_docs_button)
 
         main_layout.addLayout(input_row)
         outer.addWidget(main_widget, stretch=1)
@@ -356,6 +519,9 @@ class MainWindow(QMainWindow):
     # ── Qt overrides ───────────────────────────────────────────────────────
 
     def eventFilter(self, obj, event):
+        if obj == self._input_field and event.type() == QEvent.Type.Resize:
+            self._position_use_docs_button()
+
         if (
             obj == self._input_field
             and event.type() == event.Type.KeyPress
@@ -374,11 +540,102 @@ class MainWindow(QMainWindow):
 
         return super().eventFilter(obj, event)
 
+    def _position_use_docs_button(self) -> None:
+        if not hasattr(self, "_use_docs_btn") or not hasattr(self, "_input_field"):
+            return
+        margin = 8
+        x = self._input_field.width() - self._use_docs_btn.width() - margin
+        y = self._input_field.height() - self._use_docs_btn.height() - margin
+        self._use_docs_btn.move(max(margin, x), max(margin, y))
+
+    def _update_use_docs_state(self) -> None:
+        if not hasattr(self, "_use_docs_btn"):
+            return
+        has_docs = any(
+            path.is_file() and not path.name.startswith(".")
+            for path in DOCS_DIR.iterdir()
+        )
+        self._use_docs_btn.setEnabled(has_docs)
+        if not has_docs:
+            self._use_docs_btn.setChecked(False)
+            self._use_docs_btn.setToolTip("Upload documents to enable document search")
+        else:
+            self._use_docs_btn.setToolTip("Use uploaded documents when answering")
+
     def closeEvent(self, event):
         log("UI", "Application closing")
+        if not self._app_initialized:
+            super().closeEvent(event)
+            return
         self._save_current_chat()
+        self._cancel_transient_ui_work()
+        workers = self._background_workers()
+        for _, worker in workers:
+            _request_worker_stop(worker)
         stop_server()
+        still_running = []
+        for label, worker in workers:
+            if not _wait_worker_stopped(label, worker, timeout_ms=self.SHUTDOWN_WAIT_MS):
+                still_running.append(label)
+        if still_running:
+            event.ignore()
+            self.setEnabled(False)
+            labels = ", ".join(still_running)
+            log("UI", f"Shutdown deferred; workers still running: {labels}")
+            self._schedule_shutdown_retry()
+            return
         super().closeEvent(event)
+
+    def _schedule_shutdown_retry(self) -> None:
+        if self._shutdown_retry_scheduled:
+            return
+        self._shutdown_retry_scheduled = True
+        QTimer.singleShot(self.SHUTDOWN_RETRY_MS, self._retry_close_after_workers)
+
+    def _retry_close_after_workers(self) -> None:
+        self._shutdown_retry_scheduled = False
+        self.close()
+
+    def _cancel_transient_ui_work(self) -> None:
+        cancel_trends_render = getattr(
+            self._home_screen.trends,
+            "_cancel_pending_render",
+            None,
+        )
+        if callable(cancel_trends_render):
+            cancel_trends_render()
+
+    def _background_workers(self) -> list[tuple[str, object]]:
+        workers = [
+            ("chat generation", self._worker),
+            ("chat compression", self._compression_worker),
+            ("model download", self._download_worker),
+            ("model server start", self._server_worker),
+        ]
+
+        for label, docs in (
+            ("onboarding documents", self._documents_setup_screen.docs),
+            ("home documents", self._home_screen.documents),
+        ):
+            workers.extend(
+                [
+                    (f"{label} vision model", docs._ensure_worker),
+                    (f"{label} indexing", docs._index_worker),
+                ]
+            )
+
+        workers.extend(
+            [
+                ("onboarding model download", self._model_download_screen._worker),
+                ("health report", self._home_screen.health_report._worker),
+                ("trends extraction", self._home_screen.trends._worker),
+            ]
+        )
+        # Model Hub now supports multiple concurrent downloads, keyed by
+        # token. Wait for all of them.
+        for token, worker in self._home_screen.model_hub._download_workers.items():
+            workers.append((f"model hub download {token}", worker))
+        return [(label, worker) for label, worker in workers if worker is not None]
 
     # ── System stats ────────────────────────────────────────────────────────
 
@@ -390,6 +647,49 @@ class MainWindow(QMainWindow):
         total_gb = mem.total / (1024**3)
         self._mem_chip.setText(f"Memory {used_gb:.1f}/{total_gb:.1f} GB")
         self._cpu_chip.setText(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
+
+    @staticmethod
+    def _format_token_count(n: int) -> str:
+        if n >= 1000:
+            return f"{n / 1000:.1f}K"
+        return str(n)
+
+    def _update_ctx_chip(self) -> None:
+        """Refresh the context-usage chip in the chat top bar.
+
+        Used = approximate token count of the current chat history (chars / 3
+        plus a small system-prompt overhead). This is an estimate, not a
+        server tokenize call — fine for a status indicator and avoids
+        per-keystroke HTTP roundtrips.
+
+        Total = the per-model `ctx_size` for whatever model is *actually*
+        running (not the saved `model_path`, which can lag behind the live
+        server after a model swap). Falls back to that model's max ctx if
+        no per-model value is saved.
+        """
+        if not hasattr(self, "_ctx_chip"):
+            return
+        from config import load_ctx_size, load_model_meta, load_model_path
+        from core.llm_engine import get_current_model_path
+
+        # Source of truth is the live llama-server's model. If no server
+        # is running, fall back to the saved path (best-effort).
+        path = get_current_model_path() or load_model_path()
+        meta = load_model_meta(path) if path else None
+        model_max = (meta or {}).get("context_length")
+
+        n_ctx = load_ctx_size(path) or model_max or 8192
+
+        history_chars = sum(len(m.get("content", "")) for m in self._history)
+        # ~3 chars per token (slightly pessimistic for English clinical text)
+        # plus ~500 tokens for the system prompt + per-turn scaffolding.
+        used = history_chars // 3 + 500
+        used = min(used, n_ctx)
+
+        self._ctx_chip.setText(
+            f"Context: {self._format_token_count(used)}/"
+            f"{self._format_token_count(n_ctx)}"
+        )
 
     # ── Profile / app actions ──────────────────────────────────────────────
 
@@ -410,9 +710,6 @@ class MainWindow(QMainWindow):
 
     def _on_default_model_error(self, error: str):
         self._model_controller.on_default_model_error(error)
-
-    def _select_model(self):
-        self._model_controller.select_model()
 
     def _on_docs_model_swapped(self, model_path: str, display_name: str):
         self._documents_controller.on_docs_model_swapped(model_path, display_name)
@@ -456,19 +753,19 @@ class MainWindow(QMainWindow):
         self._chat_controller.toggle_thinking(tid, info)
 
     def _on_thinking_token(self, token: str):
-        self._chat_controller.on_thinking_token(token)
+        self._chat_controller.on_thinking_token(None, token)
 
     def _on_response_token(self, token: str):
-        self._chat_controller.on_response_token(token)
+        self._chat_controller.on_response_token(None, token)
 
     def _on_generation_done(self):
         self._chat_controller.on_generation_done()
 
     def _on_generation_error(self, error: str):
-        self._chat_controller.on_generation_error(error)
+        self._chat_controller.on_generation_error(None, error)
 
     def _on_compression_done(self, summary: str):
-        self._chat_controller.on_compression_done(summary)
+        self._chat_controller.on_compression_done(None, summary)
 
     def _on_compression_error(self, error: str):
-        self._chat_controller.on_compression_error(error)
+        self._chat_controller.on_compression_error(None, error)

@@ -1,4 +1,4 @@
 from ui.models.controller import ModelController
-from ui.models.view import ModelHubWidget, ModelSelectDialog
+from ui.models.hub_widget import ModelHubWidget
 
-__all__ = ["ModelController", "ModelHubWidget", "ModelSelectDialog"]
+__all__ = ["ModelController", "ModelHubWidget"]

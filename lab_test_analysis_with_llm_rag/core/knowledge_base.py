@@ -7,6 +7,7 @@ Pipeline:
 """
 
 import re
+import shutil
 import threading
 from pathlib import Path
 
@@ -78,6 +79,14 @@ def _get_collection() -> chromadb.Collection:
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
+
+
+def clear_index() -> None:
+    """Drop the local vector database and reset the Chroma client."""
+    global _client
+    with _client_lock:
+        _client = None
+    shutil.rmtree(CHROMA_DIR, ignore_errors=True)
 
 
 # ── Chunking ───────────────────────────────────────────────────────────
