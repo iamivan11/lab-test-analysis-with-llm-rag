@@ -1,6 +1,5 @@
 """Documents content widget — manage uploaded lab test documents."""
 
-import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
@@ -21,6 +20,7 @@ from config import DOCS_DIR, format_size, save_model_path
 from core.document_parser import SUPPORTED_EXTENSIONS
 from core.knowledge_base import remove_document
 from core.logger import log
+from core.security import write_protected_bytes
 from ui.documents.workers import (
     FILTERING_OUTPUT_DIR,
     PARSING_OUTPUT_DIR,
@@ -34,6 +34,7 @@ class DocumentsHubWidget(QWidget):
 
     model_swapped = Signal(str, str)
     parsing_active_changed = Signal(bool)
+    docs_changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -43,6 +44,8 @@ class DocumentsHubWidget(QWidget):
         self._current_batch: list[Path] = []
         self._cancelled = False
         self._reindex_active = False
+        self._operation_token = 0
+        self._table_signature: tuple[object, ...] | None = None
         self._build_ui()
         self._refresh_list()
 
@@ -61,15 +64,8 @@ class DocumentsHubWidget(QWidget):
         self._upload_btn.clicked.connect(self._upload_files)
         self.header_row.addWidget(self._upload_btn)
 
-        self._reindex_btn = QPushButton("Reindex")
-        self._reindex_btn.setObjectName("attachButton")
-        self._reindex_btn.setFixedSize(100, 38)
-        self._reindex_btn.setEnabled(False)
-        self._reindex_btn.clicked.connect(self._reindex_files)
-        self.header_row.addWidget(self._reindex_btn)
-
         self._delete_all_btn = QPushButton("Delete All")
-        self._delete_all_btn.setObjectName("attachButton")
+        self._delete_all_btn.setObjectName("stopButton")
         self._delete_all_btn.setFixedSize(100, 38)
         self._delete_all_btn.setEnabled(False)
         self._delete_all_btn.clicked.connect(self._delete_all)
@@ -128,10 +124,18 @@ class DocumentsHubWidget(QWidget):
         )
         self._populate_table(files, deletable=True)
         self._status.setText(f"{len(files)} document(s)")
-        self._reindex_btn.setEnabled(len(files) > 0)
         self._delete_all_btn.setEnabled(len(files) > 0)
+        self.docs_changed.emit()
 
     def _populate_table(self, files: list[Path], deletable: bool):
+        signature = (
+            deletable,
+            tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in files),
+        )
+        if signature == self._table_signature:
+            return
+
+        self._table_signature = signature
         self._table.setRowCount(len(files))
         for row, file_path in enumerate(files):
             name_item = QTableWidgetItem(file_path.name)
@@ -169,7 +173,7 @@ class DocumentsHubWidget(QWidget):
             dest = DOCS_DIR / src.name
             if dest.exists():
                 continue
-            shutil.copy2(src, dest)
+            write_protected_bytes(dest, src.read_bytes())
             new_files.append(dest)
 
         if new_files:
@@ -185,6 +189,8 @@ class DocumentsHubWidget(QWidget):
             return
 
         self._cancelled = False
+        self._operation_token += 1
+        token = self._operation_token
         self._reindex_active = False
         self._current_batch = list(file_paths)
         self._upload_btn.setEnabled(False)
@@ -199,9 +205,17 @@ class DocumentsHubWidget(QWidget):
         self.parsing_active_changed.emit(True)
 
         self._ensure_worker = EnsureVisionModelWorker()
-        self._ensure_worker.progress.connect(self._on_index_progress)
-        self._ensure_worker.finished.connect(self._on_vision_model_ready)
-        self._ensure_worker.error_occurred.connect(self._on_index_error)
+        self._ensure_worker.progress.connect(
+            lambda msg, token=token: self._on_index_progress(token, msg)
+        )
+        self._ensure_worker.finished.connect(
+            lambda model_path, display_name, token=token: self._on_vision_model_ready(
+                token, model_path, display_name
+            )
+        )
+        self._ensure_worker.error_occurred.connect(
+            lambda error, token=token: self._on_index_error(token, error)
+        )
         self._ensure_worker.start()
 
     def _start_reindexing(self, file_paths: list[Path]):
@@ -213,10 +227,11 @@ class DocumentsHubWidget(QWidget):
             return
 
         self._cancelled = False
+        self._operation_token += 1
+        token = self._operation_token
         self._reindex_active = True
         self._current_batch = []
         self._upload_btn.setEnabled(False)
-        self._reindex_btn.setEnabled(False)
         self._delete_all_btn.setEnabled(False)
         self._progress_bar.setValue(0)
         self._progress_bar.setMaximum(len(file_paths))
@@ -227,14 +242,10 @@ class DocumentsHubWidget(QWidget):
         self.parsing_active_changed.emit(True)
 
         self._index_worker = IndexWorker(file_paths, reuse_filtered=True)
-        self._index_worker.progress.connect(self._on_index_progress)
-        self._index_worker.file_progress.connect(self._on_file_progress)
-        self._index_worker.finished.connect(self._on_index_done)
-        self._index_worker.failed_files.connect(self._on_files_failed)
-        self._index_worker.error_occurred.connect(self._on_index_error)
+        self._wire_index_worker(token)
         self._index_worker.start()
 
-    def _reindex_files(self):
+    def reindex_files(self):
         files = sorted(
             [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")],
             key=lambda f: f.name.lower(),
@@ -276,14 +287,40 @@ class DocumentsHubWidget(QWidget):
     def _finalize_parsing(self, status_text: str):
         self._progress_widget.setVisible(False)
         self._upload_btn.setEnabled(True)
-        self._reindex_btn.setEnabled(True)
         self._delete_all_btn.setEnabled(True)
         self._reindex_active = False
         self._status.setText(status_text)
         self._refresh_list()
         self.parsing_active_changed.emit(False)
 
-    def _on_vision_model_ready(self, model_path: str, display_name: str):
+    def _is_current_operation(self, token: int) -> bool:
+        if token == self._operation_token:
+            return True
+        log("DOCS", f"Ignored stale worker signal: token={token}")
+        return False
+
+    def _wire_index_worker(self, token: int) -> None:
+        self._index_worker.progress.connect(
+            lambda msg, token=token: self._on_index_progress(token, msg)
+        )
+        self._index_worker.file_progress.connect(
+            lambda done, total, token=token: self._on_file_progress(token, done, total)
+        )
+        self._index_worker.finished.connect(
+            lambda chunks, cancelled, token=token: self._on_index_done(
+                token, chunks, cancelled
+            )
+        )
+        self._index_worker.failed_files.connect(
+            lambda failed, token=token: self._on_files_failed(token, failed)
+        )
+        self._index_worker.error_occurred.connect(
+            lambda error, token=token: self._on_index_error(token, error)
+        )
+
+    def _on_vision_model_ready(self, token: int, model_path: str, display_name: str):
+        if not self._is_current_operation(token):
+            return
         if model_path and Path(model_path).exists():
             save_model_path(model_path)
             self.model_swapped.emit(model_path, display_name)
@@ -301,20 +338,22 @@ class DocumentsHubWidget(QWidget):
             return
 
         self._index_worker = IndexWorker(file_paths)
-        self._index_worker.progress.connect(self._on_index_progress)
-        self._index_worker.file_progress.connect(self._on_file_progress)
-        self._index_worker.finished.connect(self._on_index_done)
-        self._index_worker.failed_files.connect(self._on_files_failed)
-        self._index_worker.error_occurred.connect(self._on_index_error)
+        self._wire_index_worker(token)
         self._index_worker.start()
 
-    def _on_index_progress(self, msg: str):
+    def _on_index_progress(self, token: int, msg: str):
+        if not self._is_current_operation(token):
+            return
         self._status.setText(msg)
 
-    def _on_file_progress(self, done: int, total: int):
+    def _on_file_progress(self, token: int, done: int, total: int):
+        if not self._is_current_operation(token):
+            return
         self._progress_bar.setValue(done)
 
-    def _on_files_failed(self, failed: list[Path]):
+    def _on_files_failed(self, token: int, failed: list[Path]):
+        if not self._is_current_operation(token):
+            return
         if self._reindex_active:
             self._refresh_list()
             self._status.setText(f"Reindex failed for {len(failed)} document(s)")
@@ -325,7 +364,9 @@ class DocumentsHubWidget(QWidget):
             log("DOCS", f"Removed failed file: {path.name}")
         self._refresh_list()
 
-    def _on_index_done(self, total_chunks: int, cancelled: bool):
+    def _on_index_done(self, token: int, total_chunks: int, cancelled: bool):
+        if not self._is_current_operation(token):
+            return
         log("DOCS", f"Indexing complete: {total_chunks} chunks stored, cancelled={cancelled}")
         if cancelled:
             self._cleanup_batch()
@@ -334,7 +375,9 @@ class DocumentsHubWidget(QWidget):
             self._current_batch = []
             self._finalize_parsing(f"Indexing complete — {total_chunks} chunks stored")
 
-    def _on_index_error(self, error: str):
+    def _on_index_error(self, token: int, error: str):
+        if not self._is_current_operation(token):
+            return
         log("DOCS", f"Indexing error: {error}")
         if self._cancelled:
             self._cleanup_batch()
@@ -347,6 +390,7 @@ class DocumentsHubWidget(QWidget):
         log("DOCS", f"Deleting document: {path.name}")
         remove_document(path.name)
         path.unlink(missing_ok=True)
+        self._table_signature = None
         self._status.setText(f"Deleted: {path.name}")
         self._refresh_list()
 
@@ -356,6 +400,7 @@ class DocumentsHubWidget(QWidget):
         for file_path in files:
             remove_document(file_path.name)
             file_path.unlink(missing_ok=True)
+        self._table_signature = None
         self._status.setText(f"Deleted {len(files)} document(s)")
         self._refresh_list()
 

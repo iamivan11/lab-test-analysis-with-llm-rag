@@ -18,6 +18,7 @@ from core.health_report import (
 )
 from core.llm_engine import generate_stream
 from core.logger import log
+from core.security import write_protected_text
 
 
 class HealthReportWorker(QThread):
@@ -112,8 +113,7 @@ class HealthReportWorker(QThread):
                     self.error_occurred.emit(
                         "The model spent its entire output budget on "
                         "internal reasoning and produced no report. "
-                        "Increase Max Tokens in Settings, or shorten the "
-                        "uploaded documents."
+                        "Shorten the uploaded documents and try again."
                     )
                 else:
                     self.error_occurred.emit("Model produced no report content.")
@@ -129,7 +129,7 @@ class HealthReportWorker(QThread):
                 + render_message_html(markdown)
             )
             write_report_pdf(html, HEALTH_REPORT_PDF)
-            HEALTH_REPORT_MD.write_text(markdown, encoding="utf-8")
+            write_protected_text(HEALTH_REPORT_MD, markdown)
 
             used_documents = (
                 [name for name, _ in doc_texts]

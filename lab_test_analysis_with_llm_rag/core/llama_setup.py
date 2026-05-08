@@ -11,9 +11,10 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from config import PROJECT_ROOT
 from core.logger import log
 
-BIN_DIR = Path(__file__).resolve().parents[2] / "bin"
+BIN_DIR = PROJECT_ROOT / "bin"
 SERVER_BINARY = BIN_DIR / "llama-server"
 REPO_URL = "https://github.com/ggerganov/llama.cpp.git"
 

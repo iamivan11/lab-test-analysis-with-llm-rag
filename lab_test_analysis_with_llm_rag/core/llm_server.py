@@ -4,20 +4,19 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from pathlib import Path
 
 import httpx
 
 from config import (
-    DEFAULT_MMPROJ_LOCAL,
-    DEFAULT_MODEL_FILE,
     LLM_HEALTH_TIMEOUT_SECONDS,
     LLM_SERVER_READY_TIMEOUT_SECONDS,
-    MODELS_DIR,
     PROJECT_ROOT,
     SERVER_HOST,
     SERVER_PORT,
+    approved_model_file_path,
+    approved_model_for_file,
 )
+from core.device_compat import current_device_capabilities, llama_gpu_layer_args
 from core.logger import log
 
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
@@ -69,6 +68,7 @@ class LlamaServer:
         self._stderr_buffer: deque[str] = deque(maxlen=_STDERR_RING_SIZE)
         self._stderr_thread: threading.Thread | None = None
         self._progress_cb: Callable[[str], None] | None = None
+        self._start_generation = 0
 
     def is_running(self) -> bool:
         with self._lock:
@@ -80,43 +80,77 @@ class LlamaServer:
                 return None
             return self._model_path
 
+    def recent_stderr(self, n: int = 30) -> list[str]:
+        """Return the last n lines llama-server has emitted to stderr.
+
+        Useful when an inference call fails with a generic 5xx — the actual
+        cause (OOM, Metal kernel error, KV-cache corruption, etc.) is in
+        these lines.
+        """
+        with self._lock:
+            buf = list(self._stderr_buffer)
+        return buf[-n:]
+
     def start(
         self,
         model_path: str,
         n_ctx: int = 32768,
         on_progress: Callable[[str], None] | None = None,
     ) -> None:
-        with self._lock:
-            log("SERVER", f"start called, model={model_path}, n_ctx={n_ctx}")
+        log("SERVER", f"start called, model={model_path}, n_ctx={n_ctx}")
 
-            from core.llama_setup import ensure_server
+        from core.llama_setup import ensure_server
 
-            ensure_server(on_progress=on_progress)
+        ensure_server(on_progress=on_progress)
 
-            self._stop_locked()
-            _kill_port()
+        capabilities = current_device_capabilities()
+        gpu_args = llama_gpu_layer_args(capabilities)
+        log(
+            "SERVER",
+            "Device capabilities: "
+            f"system={capabilities.system}, machine={capabilities.machine}, "
+            f"metal={capabilities.metal_available}, gpu_args={' '.join(gpu_args)}",
+        )
 
-            cmd = [
-                str(SERVER_BINARY),
-                "--model",
-                model_path,
-                "--host",
-                SERVER_HOST,
-                "--port",
-                str(SERVER_PORT),
-                "--ctx-size",
-                str(n_ctx),
-                "-ngl",
-                "99",
-                "--no-webui",
-                "--parallel",
-                "2",
-            ]
-            if Path(model_path).name == DEFAULT_MODEL_FILE:
-                mmproj_path = MODELS_DIR / DEFAULT_MMPROJ_LOCAL
+        cmd = [
+            str(SERVER_BINARY),
+            "--model",
+            model_path,
+            "--host",
+            SERVER_HOST,
+            "--port",
+            str(SERVER_PORT),
+            "--ctx-size",
+            str(n_ctx),
+            *gpu_args,
+            "--no-webui",
+            # Single-user app — one slot is enough. Two slots reserve a
+            # second copy of the KV cache (significant on large models)
+            # for no benefit.
+            "--parallel",
+            "1",
+            # Smaller batch / ubatch keeps Metal activation memory under
+            # control during prefill on Apple Silicon. The default
+            # batch=2048 OOM'd on 27B models with KV+ctx already
+            # competing for the unified-memory budget.
+            "--batch-size",
+            "512",
+            "--ubatch-size",
+            "128",
+        ]
+        if model := approved_model_for_file(model_path):
+            mmproj_local = model.get("mmproj_local")
+            if mmproj_local:
+                mmproj_path = approved_model_file_path(model, mmproj_local)
                 if mmproj_path.exists():
                     cmd.extend(["--mmproj", str(mmproj_path)])
-            log("SERVER", f"Launching llama-server: {' '.join(cmd)}")
+        log("SERVER", f"Launching llama-server: {' '.join(cmd)}")
+
+        with self._lock:
+            self._start_generation += 1
+            generation = self._start_generation
+            self._stop_locked(invalidate_start=False)
+            _kill_port()
 
             self._stderr_buffer.clear()
             self._progress_cb = on_progress
@@ -127,6 +161,7 @@ class LlamaServer:
                 text=True,
                 bufsize=1,
             )
+            proc = self._process
             log("SERVER", f"Process started, pid={self._process.pid}")
 
             self._stderr_thread = threading.Thread(
@@ -134,20 +169,31 @@ class LlamaServer:
             )
             self._stderr_thread.start()
 
-            try:
-                self._wait_for_ready()
-            except Exception:
-                self._dump_stderr_buffer()
-                self._stop_locked()
-                raise
+        try:
+            self._wait_for_ready(generation, proc)
+        except Exception:
+            with self._lock:
+                if generation == self._start_generation:
+                    self._dump_stderr_buffer()
+                    self._stop_locked(invalidate_start=False)
+            raise
+        with self._lock:
+            if (
+                generation != self._start_generation
+                or self._process is not proc
+                or self._process.poll() is not None
+            ):
+                raise RuntimeError("llama-server start was cancelled.")
             self._model_path = model_path
-            log("SERVER", "Server is ready")
+        log("SERVER", "Server is ready")
 
     def stop(self) -> None:
         with self._lock:
             self._stop_locked()
 
-    def _stop_locked(self) -> None:
+    def _stop_locked(self, *, invalidate_start: bool = True) -> None:
+        if invalidate_start:
+            self._start_generation += 1
         status = "alive" if self._process and self._process.poll() is None else "none"
         log("SERVER", f"stop called, process={status}")
         if self._process and self._process.poll() is None:
@@ -180,11 +226,20 @@ class LlamaServer:
                         with contextlib.suppress(Exception):
                             cb(msg)
 
-    def _wait_for_ready(self, timeout: int = LLM_SERVER_READY_TIMEOUT_SECONDS) -> None:
+    def _wait_for_ready(
+        self,
+        generation: int,
+        proc: subprocess.Popen,
+        timeout: int = LLM_SERVER_READY_TIMEOUT_SECONDS,
+    ) -> None:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            proc = self._process
-            if proc is not None and proc.poll() is not None:
+            with self._lock:
+                if generation != self._start_generation or self._process is not proc:
+                    raise RuntimeError("llama-server start was cancelled.")
+                if proc.poll() is not None:
+                    raise RuntimeError("llama-server process exited unexpectedly")
+            if proc.poll() is not None:
                 raise RuntimeError("llama-server process exited unexpectedly")
             try:
                 r = httpx.get(f"{SERVER_URL}/health", timeout=1)
@@ -232,3 +287,8 @@ def is_server_running() -> bool:
         return r.status_code == 200
     except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout):
         return False
+
+
+def recent_server_stderr(n: int = 30) -> list[str]:
+    """Last n stderr lines from the running llama-server process."""
+    return _server.recent_stderr(n=n)

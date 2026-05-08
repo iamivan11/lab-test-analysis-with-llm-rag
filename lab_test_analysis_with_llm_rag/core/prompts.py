@@ -28,6 +28,21 @@ and end with |. Always leave a blank line before and after the table. Example:
 - Do not prescribe treatments or medications.
 """
 
+ANSWER_DETAIL_INSTRUCTIONS = {
+    "short": (
+        "Answer briefly in 1-2 short paragraphs. Include only the direct answer "
+        "and the most important supporting values."
+    ),
+    "balanced": (
+        "Answer with moderate detail. Include the direct answer, key supporting "
+        "values, and concise interpretation."
+    ),
+    "detailed": (
+        "Answer in more detail when useful. Include relevant supporting values, "
+        "comparisons, caveats, and interpretation, while avoiding filler."
+    ),
+}
+
 RAG_COMPRESSION_PROMPT = """\
 You compress retrieved medical context before it is sent to the answering model.
 

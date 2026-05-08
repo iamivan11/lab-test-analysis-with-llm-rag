@@ -1,26 +1,49 @@
 import sys
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QMessageBox,
+)
 
-from config import APP_LOG_FILE, set_onboarding_complete
+from config import (
+    APP_LOG_FILE,
+    MIN_MACOS_VERSION,
+)
 from core.logger import enable_file_logging, log
+from core.macos_compat import check_macos_compatibility
+from core.security import is_security_configured
 from ui.main_window import MainWindow
 
-# Dev override: force the onboarding flow on every launch until removed.
-# Remove the line below to restore "first launch onboards, then boots into Home".
-FORCE_ONBOARDING_ON_EVERY_LAUNCH = True
+
+def _create_main_window() -> MainWindow:
+    window = MainWindow(
+        start_locked=is_security_configured(),
+    )
+    window.show()
+    log("APP", "Window shown")
+    return window
 
 
 def main():
     enable_file_logging(APP_LOG_FILE)
     log("APP", "Starting application")
-    if FORCE_ONBOARDING_ON_EVERY_LAUNCH:
-        set_onboarding_complete(False)
-        log("APP", "Dev override: onboarding will replay on this launch")
     qt_app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    log("APP", "Window shown, entering event loop")
+    compatibility = check_macos_compatibility(MIN_MACOS_VERSION)
+    if not compatibility.is_supported:
+        log("APP", f"Unsupported macOS version: {compatibility.current_version}")
+        QMessageBox.critical(
+            None,
+            "Unsupported macOS version",
+            (
+                f"This app requires macOS {compatibility.minimum_version} or newer.\n"
+                f"Current version: {compatibility.current_version}"
+            ),
+        )
+        sys.exit(1)
+
+    qt_app.main_window = _create_main_window()
+
+    log("APP", "Entering event loop")
     sys.exit(qt_app.exec())
 
 

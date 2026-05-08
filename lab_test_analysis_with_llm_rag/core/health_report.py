@@ -10,18 +10,26 @@ Layout on disk (under DATA_DIR):
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QMarginsF
 from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
 
-from config import DATA_DIR, DOCS_DIR, PARSING_OUTPUT_DIR
+from config import DOCS_DIR, PARSING_OUTPUT_DIR, REPORTS_DIR
 from core.logger import log
+from core.security import (
+    read_protected_json,
+    read_protected_text,
+    write_protected_bytes,
+    write_protected_json,
+)
 
-HEALTH_REPORT_PDF = DATA_DIR / "health_report.pdf"
-HEALTH_REPORT_MD = DATA_DIR / "health_report.md"
-HEALTH_REPORT_META = DATA_DIR / "health_report.meta.json"
+HEALTH_REPORT_PDF = REPORTS_DIR / "health_report.pdf"
+HEALTH_REPORT_MD = REPORTS_DIR / "health_report.md"
+HEALTH_REPORT_META = REPORTS_DIR / "health_report.meta.json"
 
 
 # ── Disk I/O ───────────────────────────────────────────────────────────────
@@ -35,21 +43,19 @@ def load_metadata() -> dict:
     if not HEALTH_REPORT_META.exists():
         return {}
     try:
-        return json.loads(HEALTH_REPORT_META.read_text())
+        return read_protected_json(HEALTH_REPORT_META)
     except (OSError, json.JSONDecodeError) as e:
         log("HEALTH", f"Failed to read metadata: {e}")
         return {}
 
 
 def save_metadata(used_documents: list[str]) -> None:
-    HEALTH_REPORT_META.write_text(
-        json.dumps(
-            {
-                "generated_at": datetime.now(UTC).isoformat(),
-                "used_documents": sorted(used_documents),
-            },
-            indent=2,
-        )
+    write_protected_json(
+        HEALTH_REPORT_META,
+        {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "used_documents": sorted(used_documents),
+        },
     )
 
 
@@ -87,7 +93,7 @@ def _read_parsed_markdown(name: str) -> str:
     md_path = PARSING_OUTPUT_DIR / f"{stem}.md"
     if md_path.exists():
         try:
-            return md_path.read_text(encoding="utf-8")
+            return read_protected_text(md_path)
         except OSError as e:
             log("HEALTH", f"Failed to read {md_path}: {e}")
     return ""
@@ -155,12 +161,35 @@ def _full_report_user_prompt(docs: list[tuple[str, str]]) -> str:
         "One short paragraph: name, age, gender, key vitals, and a "
         "one-line summary of presenting concerns based on the documents.\n\n"
         "## Lab Findings Across Dates\n"
-        "For every lab marker that appears in two or more documents, "
-        "present a markdown table with columns Date | Value | Reference | "
-        "Status. **Rows MUST be sorted by Date ascending (oldest at the "
-        "top, newest at the bottom).** Use ISO format YYYY-MM-DD. Note "
-        "values that fall outside the reference range in the Status "
-        "column.\n\n"
+        "**Group lab findings by clinical panel / category and produce a "
+        "SEPARATE markdown table for each group.** Do NOT mix unrelated "
+        "markers in one table. Use an H3 heading (`### Panel name`) above "
+        "each table. Typical panels include (use only those actually "
+        "present in the documents, and add others as needed): Hormones, "
+        "Reproductive Hormones, Thyroid Panel, Spermogram / Semen "
+        "Analysis, Complete Blood Count (CBC), Lipid Panel, Liver "
+        "Function, Kidney Function, Glucose / Glycemic, Vitamins & "
+        "Minerals, Inflammation Markers, Coagulation, Urinalysis, "
+        "Imaging Findings.\n"
+        "Each table has these columns in this exact order: "
+        "Date | Marker | Value | Reference | Status. "
+        "Use a short, standardized name in the Marker column — drop "
+        "redundant suffixes like specimen type, units, or full "
+        "expanded form (e.g. \"TSH\" instead of \"Thyroid-stimulating "
+        "hormone, serum\"; \"LH\" instead of \"Luteinizing hormone\"; "
+        "\"Hemoglobin\" instead of \"Hemoglobin, whole blood, g/dL\"). "
+        "**Keep clinically meaningful qualifiers** that distinguish "
+        "related markers — \"Total testosterone\" and \"Free "
+        "testosterone\" are different markers and must remain separate "
+        "rows; same for \"LDL cholesterol\" vs \"HDL cholesterol\", "
+        "\"Fasting glucose\" vs \"Postprandial glucose\", \"Direct "
+        "bilirubin\" vs \"Total bilirubin\", and so on.\n"
+        "**Rows MUST be sorted by Date ascending (oldest at the top, "
+        "newest at the bottom)**, and within the same date by Marker "
+        "name. Use ISO format YYYY-MM-DD. Note values outside the "
+        "reference range in the Status column. Include every marker that "
+        "appears in any document — do not silently drop markers because "
+        "they appear only once.\n\n"
         "## Surgical History\n"
         "List surgeries with dates if known, **sorted from oldest to "
         "newest**. State \"None reported\" if no surgeries appear in any "
@@ -228,23 +257,39 @@ def build_update_report_history(
 
 
 def write_report_pdf(html: str, path: Path = HEALTH_REPORT_PDF) -> None:
-    writer = QPdfWriter(str(path))
-    writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-    writer.setPageMargins(QMarginsF(20, 20, 20, 20))
-    doc = QTextDocument()
-    doc.setDefaultStyleSheet(
-        "body { font-family: -apple-system, Helvetica, Arial, sans-serif; "
-        "font-size: 11pt; color: #1e1e2e; }"
-        "h1 { font-size: 22pt; margin: 0 0 12px; }"
-        "h2 { font-size: 16pt; margin: 18px 0 6px; }"
-        "h3 { font-size: 13pt; margin: 12px 0 4px; }"
-        "p { margin: 6px 0; line-height: 1.4; }"
-        "table { border-collapse: collapse; margin: 8px 0; }"
-        "th, td { border: 1px solid #999; padding: 4px 8px; }"
-        "th { background: #eaeaea; }"
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp.pdf",
     )
-    doc.setHtml(html)
-    doc.print_(writer)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        writer = QPdfWriter(str(tmp_path))
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+        writer.setPageMargins(QMarginsF(20, 20, 20, 20))
+        doc = QTextDocument()
+        doc.setDefaultStyleSheet(
+            "body { font-family: -apple-system, Helvetica, Arial, sans-serif; "
+            "font-size: 11pt; color: #1e1e2e; }"
+            "h1 { font-size: 22pt; margin: 0 0 12px; }"
+            "h2 { font-size: 16pt; margin: 18px 0 6px; }"
+            "h3 { font-size: 13pt; margin: 12px 0 4px; }"
+            "p { margin: 6px 0; line-height: 1.4; }"
+            "table { border-collapse: collapse; margin: 8px 0; }"
+            "th, td { border: 1px solid #999; padding: 4px 8px; }"
+            "th { background: #eaeaea; }"
+        )
+        doc.setHtml(html)
+        doc.print_(writer)
+        del writer
+        write_protected_bytes(path, tmp_path.read_bytes())
+        tmp_path.unlink(missing_ok=True)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 __all__ = [

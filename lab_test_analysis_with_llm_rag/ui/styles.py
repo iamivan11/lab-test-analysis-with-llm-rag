@@ -40,7 +40,7 @@ QTextEdit, QLineEdit {
     border-radius: 8px;
     padding: 8px;
     font-size: 14px;
-    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-family: "Helvetica Neue", Helvetica, Arial;
 }
 
 QTextEdit:focus, QLineEdit:focus {
@@ -49,7 +49,7 @@ QTextEdit:focus, QLineEdit:focus {
 
 QLabel#profileSectionLabel {
     color: #89b4fa;
-    font-size: 15px;
+    font-size: 16px;
     font-weight: bold;
     padding: 0px;
 }
@@ -258,6 +258,19 @@ QDialog {
 QWidget#sidebar {
     background-color: #181825;
     border-right: 1px solid #313244;
+}
+
+QWidget#trendsContent,
+QScrollArea#trendsScrollArea,
+QScrollArea#trendsScrollArea > QWidget,
+QWidget#trendsChartsHost {
+    background-color: #1e1e2e;
+}
+
+QScrollArea#sidebarTilesScroll,
+QScrollArea#sidebarTilesScroll > QWidget,
+QScrollArea#sidebarTilesScroll > QWidget > QWidget {
+    background-color: transparent;
 }
 
 QPushButton#sidebarTile {

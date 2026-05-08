@@ -2,7 +2,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QTextBlockFormat, QTextCharFormat
 from PySide6.QtWidgets import QDialog, QListWidgetItem, QMenu
 
-from config import load_max_tokens
+from config import answer_detail_max_tokens, load_answer_detail
 from core.chat_store import (
     delete_chat,
     list_chats,
@@ -17,6 +17,55 @@ from core.logger import log
 from ui.chat.view import ChatItemWidget, RenameChatDialog, render_message_html
 from ui.chat.workers import CompressionWorker, LLMWorker
 
+TOKEN_LIMIT_NO_RESPONSE_MESSAGE = (
+    "Model used all available tokens on reasoning and produced no response. "
+    "Try increasing Answer Detail in Settings or simplifying your question."
+)
+GENERATION_INTERRUPTED_ON_CLOSE_MESSAGE = (
+    "Generation was interrupted because the app was closing. "
+    "Send the message again after reopening."
+)
+CONTEXT_TOO_LARGE_MESSAGE = (
+    "This request does not fit in the current context window. "
+    "Increase Context Window in Settings or reduce the attached/history content."
+)
+LOCAL_MODEL_STOPPED_MESSAGE = (
+    "The local model stopped during generation. Reload the model and try again."
+)
+LOCAL_MODEL_CONNECTION_MESSAGE = (
+    "Connection to the local model was interrupted during generation. "
+    "Try again; if it repeats, reload the model."
+)
+LOCAL_MODEL_MEMORY_MESSAGE = (
+    "The local model ran out of memory or failed during generation. "
+    "Lower Context Window or Answer Detail, or load a smaller model."
+)
+
+
+def _friendly_generation_error(error: str) -> str:
+    error_lower = error.lower()
+    if any(
+        kw in error_lower
+        for kw in ("out of memory", "oom", "memory", "metal", "kv-cache", "compute error")
+    ):
+        return LOCAL_MODEL_MEMORY_MESSAGE
+    if any(
+        kw in error_lower
+        for kw in ("llm server is not running", "server is not running", "not running")
+    ):
+        return LOCAL_MODEL_STOPPED_MESSAGE
+    if any(
+        kw in error_lower
+        for kw in ("connecterror", "readerror", "remoteprotocolerror", "connection", "disconnected")
+    ):
+        return LOCAL_MODEL_CONNECTION_MESSAGE
+    if any(
+        kw in error_lower
+        for kw in ("context", "token", "length", "exceed", "too long", "413", "400")
+    ):
+        return CONTEXT_TOO_LARGE_MESSAGE
+    return error
+
 
 class ChatController:
     def __init__(self, window):
@@ -30,6 +79,7 @@ class ChatController:
         self.window._thinking_blocks.clear()
         self.window._chat_display.clear()
         self.refresh_chat_list()
+        self.window._update_ctx_chip()
 
     def save_current_chat(self):
         if self.window._history:
@@ -89,6 +139,7 @@ class ChatController:
             self.window._current_chat = chat
             self.window._history = chat["history"]
             self.load_chat_into_display(chat)
+            self.window._update_ctx_chip()
 
     def on_chat_rename(self, item):
         chat_id = item.data(Qt.ItemDataRole.UserRole)
@@ -227,16 +278,34 @@ class ChatController:
         self.window._current_response = ""
         self.window._response_anchor = 0
         self.window._generation_stopped = False
-        max_tokens = load_max_tokens()
+        self.window._generation_token += 1
+        token = self.window._generation_token
+        answer_detail = load_answer_detail()
+        max_tokens = answer_detail_max_tokens(answer_detail)
+        use_rag = getattr(self.window, "_use_docs_btn", None)
+        use_rag = True if use_rag is None else use_rag.isChecked()
         self.window._worker = LLMWorker(
             list(self.window._history),
             context=context,
             max_tokens=max_tokens,
+            use_rag=use_rag,
+            answer_detail=answer_detail,
         )
-        self.window._worker.thinking_token.connect(self.on_thinking_token)
-        self.window._worker.response_token.connect(self.on_response_token)
-        self.window._worker.finished_generation.connect(self.on_generation_done)
-        self.window._worker.error_occurred.connect(self.on_generation_error)
+        self.window._worker.thinking_token.connect(
+            lambda value, token=token: self.on_thinking_token(token, value)
+        )
+        self.window._worker.response_token.connect(
+            lambda value, token=token: self.on_response_token(token, value)
+        )
+        self.window._worker.finished_generation.connect(
+            lambda token=token: self.on_generation_done(token)
+        )
+        self.window._worker.cancelled_generation.connect(
+            lambda token=token: self.on_generation_cancelled(token)
+        )
+        self.window._worker.error_occurred.connect(
+            lambda error, token=token: self.on_generation_error(token, error)
+        )
         self.window._stop_btn.setEnabled(True)
         self.window._worker.start()
 
@@ -355,9 +424,25 @@ class ChatController:
         self.window._chat_display.setTextCursor(cursor)
         self.window._chat_display.viewport().update()
 
-    def on_thinking_token(self, token: str):
+    def _is_current_generation(self, token: int | None) -> bool:
+        if token is None or token == self.window._generation_token:
+            return True
+        log("UI", f"Ignored stale generation signal: token={token}")
+        return False
+
+    def _is_current_compression(self, token: int | None) -> bool:
+        if token is None or token == self.window._compression_token:
+            return True
+        log("UI", f"Ignored stale compression signal: token={token}")
+        return False
+
+    def on_thinking_token(self, token: int | None, value: str = ""):
+        if isinstance(token, str) and not value:
+            token, value = None, token
+        if not self._is_current_generation(token):
+            return
         first = not self.window._thinking_text
-        self.window._thinking_text += token
+        self.window._thinking_text += value
         if first:
             tid = self.window._thinking_id_counter
             self.window._thinking_id_counter += 1
@@ -394,12 +479,16 @@ class ChatController:
             cursor.movePosition(cursor.MoveOperation.End)
             fmt = QTextCharFormat()
             fmt.setForeground(QColor("#6c7086"))
-            cursor.insertText(token, fmt)
+            cursor.insertText(value, fmt)
             info["content_end"] = cursor.blockNumber()
             if at_bottom:
                 scrollbar.setValue(scrollbar.maximum())
 
-    def on_response_token(self, token: str):
+    def on_response_token(self, token: int | None, value: str = ""):
+        if isinstance(token, str) and not value:
+            token, value = None, token
+        if not self._is_current_generation(token):
+            return
         if self.window._thinking:
             self.window._thinking = False
             if self.window._thinking_text:
@@ -417,7 +506,7 @@ class ChatController:
             cursor.movePosition(cursor.MoveOperation.End)
             self.window._response_anchor = cursor.position()
 
-        self.window._current_response += token
+        self.window._current_response += value
         html = render_message_html(self.window._current_response)
         scrollbar = self.window._chat_display.verticalScrollBar()
         at_bottom = scrollbar.value() >= scrollbar.maximum() - 20
@@ -439,7 +528,9 @@ class ChatController:
         else:
             scrollbar.setValue(saved_scroll)
 
-    def on_generation_done(self):
+    def on_generation_done(self, token: int | None = None):
+        if not self._is_current_generation(token):
+            return
         log(
             "UI",
             f"Generation done, response={len(self.window._current_response)} chars, "
@@ -464,11 +555,7 @@ class ChatController:
             self.save_current_chat()
             self.refresh_chat_list()
         elif self.window._thinking_text:
-            error_text = (
-                "Model used all available tokens on reasoning and produced "
-                "no response. Try increasing Max Tokens in Settings or "
-                "simplifying your question."
-            )
+            error_text = TOKEN_LIMIT_NO_RESPONSE_MESSAGE
             self.window._chat_display.append(f"<i style='color: #f38ba8;'>{error_text}</i>")
             self.window._history.append(
                 {
@@ -482,8 +569,44 @@ class ChatController:
             self.save_current_chat()
             self.refresh_chat_list()
         self.window._send_btn.setEnabled(True)
+        self.window._update_ctx_chip()
 
-    def on_generation_error(self, error: str):
+    def on_generation_cancelled(self, token: int | None = None):
+        if not self._is_current_generation(token):
+            return
+        log(
+            "UI",
+            f"Generation cancelled, response={len(self.window._current_response)} chars, "
+            f"stopped={self.window._generation_stopped}",
+        )
+        self.window._thinking = False
+        self.window._stop_btn.setEnabled(False)
+        self.window._status_label.setText(f"Model: {self.window._model_name}")
+        if self.window._generation_stopped:
+            if self.window._history and self.window._history[-1]["role"] == "user":
+                self.window._history.pop()
+        else:
+            error_text = GENERATION_INTERRUPTED_ON_CLOSE_MESSAGE
+            self.window._chat_display.append(f"<i style='color: #f38ba8;'>{error_text}</i>")
+            msg = {
+                "role": "assistant",
+                "content": error_text,
+                "model": self.window._model_name,
+                "error": True,
+            }
+            if self.window._thinking_text:
+                msg["thinking"] = self.window._thinking_text
+            self.window._history.append(msg)
+            self.save_current_chat()
+            self.refresh_chat_list()
+        self.window._send_btn.setEnabled(True)
+        self.window._update_ctx_chip()
+
+    def on_generation_error(self, token: int | None, error: str = ""):
+        if isinstance(token, str) and not error:
+            token, error = None, token
+        if not self._is_current_generation(token):
+            return
         log("UI", f"Generation error: {error}")
         self.window._thinking = False
         self.window._stop_btn.setEnabled(False)
@@ -518,17 +641,34 @@ class ChatController:
                 "<i style='color: #6c7086;'>Compressing conversation history...</i>"
             )
             self.window._compression_attempted = True
+            self.window._compression_token += 1
+            compression_token = self.window._compression_token
             self.window._compression_worker = CompressionWorker(history_to_compress)
-            self.window._compression_worker.finished.connect(self.on_compression_done)
-            self.window._compression_worker.error_occurred.connect(self.on_compression_error)
+            self.window._compression_worker.finished.connect(
+                lambda summary, token=compression_token: self.on_compression_done(
+                    token, summary
+                )
+            )
+            self.window._compression_worker.error_occurred.connect(
+                lambda error, token=compression_token: self.on_compression_error(
+                    token, error
+                )
+            )
             self.window._compression_worker.start()
         else:
             if self.window._history and self.window._history[-1]["role"] == "user":
                 self.window._history.pop()
-            self.window._chat_display.append(f"\n<i style='color: #f38ba8;'>Error: {error}</i>\n")
+            display_error = _friendly_generation_error(error)
+            self.window._chat_display.append(
+                f"\n<i style='color: #f38ba8;'>Error: {display_error}</i>\n"
+            )
             self.window._send_btn.setEnabled(True)
 
-    def on_compression_done(self, summary: str):
+    def on_compression_done(self, token: int | None, summary: str = ""):
+        if isinstance(token, str) and not summary:
+            token, summary = None, token
+        if not self._is_current_compression(token):
+            return
         log("UI", f"Compression done, summary={len(summary)} chars, retrying with pending prompt")
         self.window._history = [
             {"role": "user", "content": f"[Summary of previous conversation]\n\n{summary}"},
@@ -546,7 +686,11 @@ class ChatController:
         self.window._chat_display.setTextCursor(cursor)
         self.launch_llm_worker()
 
-    def on_compression_error(self, error: str):
+    def on_compression_error(self, token: int | None, error: str = ""):
+        if isinstance(token, str) and not error:
+            token, error = None, token
+        if not self._is_current_compression(token):
+            return
         log("UI", f"Compression error: {error}")
         if self.window._history and self.window._history[-1]["role"] == "user":
             self.window._history.pop()
