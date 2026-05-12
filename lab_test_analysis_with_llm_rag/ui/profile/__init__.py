@@ -1,4 +1,3 @@
-from ui.profile.controller import ProfileController
-from ui.profile.form import ProfileForm
+from ui.profile.form import ProfileController, ProfileForm
 
 __all__ = ["ProfileController", "ProfileForm"]

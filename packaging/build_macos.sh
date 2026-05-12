@@ -27,5 +27,12 @@ hdiutil create \
   -format UDZO \
   "$DMG_PATH"
 
-echo "Built: $APP_PATH"
+# Clean up intermediate build artifacts now that the DMG is in place.
+# PyInstaller's COLLECT step writes `dist/Lab Analyzer/` (the
+# unwrapped bundle), then BUNDLE wraps it into `dist/Lab Analyzer.app`,
+# then we copy that into `dist/dmg/` for hdiutil. None of these are
+# needed after the DMG exists — leaving them confuses users who expect
+# dist/ to contain only the .dmg.
+rm -rf "$APP_PATH" "$STAGING_DIR" "$DIST_DIR/$APP_NAME"
+
 echo "Built: $DMG_PATH"

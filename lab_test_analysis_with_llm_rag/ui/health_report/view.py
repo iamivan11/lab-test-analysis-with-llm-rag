@@ -23,20 +23,10 @@ from core.health_report import (
     report_exists,
 )
 from core.security import read_protected_bytes, read_protected_text
+from ui.components import StatsBar, TimedStatusLabel, icon_button
 from ui.health_report.workers import HealthReportWorker
 
 _ACTION_BUTTON_SIZE = (100, 38)
-
-
-def _format_time(seconds: float) -> str:
-    s = int(max(0, seconds))
-    if s < 60:
-        return f"{s}s"
-    minutes, sec = divmod(s, 60)
-    if minutes < 60:
-        return f"{minutes}m {sec:02d}s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}h {minutes:02d}m"
 
 
 class HealthReportContent(QWidget):
@@ -44,6 +34,12 @@ class HealthReportContent(QWidget):
 
     def __init__(self, build_profile_context, parent=None):
         super().__init__(parent)
+        # Injected by main_window so Generate can refuse while another
+        # LLM-using worker is on llama-server (single-slot — a parallel
+        # request just queues for minutes and looks frozen).
+        from collections.abc import Callable
+
+        self.busy_check: Callable[[], bool] | None = None
         self._build_profile_context = build_profile_context
         self._worker: HealthReportWorker | None = None
         self._token_count = 0
@@ -58,6 +54,11 @@ class HealthReportContent(QWidget):
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
 
+        # Mirrors the chat top-bar chips (model, memory, CPU, context).
+        # MainWindow.register_stats_bar pushes updates here.
+        self.stats_bar = StatsBar()
+        layout.addWidget(self.stats_bar)
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self._generate_btn = QPushButton("Generate")
@@ -65,11 +66,11 @@ class HealthReportContent(QWidget):
         self._generate_btn.clicked.connect(lambda: self._kick_off("full"))
         btn_row.addWidget(self._generate_btn)
 
-        self._update_btn = QPushButton("Update")
-        self._update_btn.setObjectName("attachButton")
-        self._update_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
-        self._update_btn.clicked.connect(lambda: self._kick_off("update"))
-        btn_row.addWidget(self._update_btn)
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setObjectName("attachButton")
+        self._refresh_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
+        self._refresh_btn.clicked.connect(lambda: self._kick_off("update"))
+        btn_row.addWidget(self._refresh_btn)
 
         btn_row.addStretch()
 
@@ -87,8 +88,7 @@ class HealthReportContent(QWidget):
 
         layout.addLayout(btn_row)
 
-        self._status_label = QLabel("")
-        self._status_label.setObjectName("statusLabel")
+        self._status_label = TimedStatusLabel("")
         layout.addWidget(self._status_label)
 
         self._progress_widget = QWidget()
@@ -103,11 +103,9 @@ class HealthReportContent(QWidget):
         self._progress.setFixedHeight(8)
         progress_row.addWidget(self._progress, stretch=1)
 
-        self._cancel_btn = QPushButton("✕")
-        self._cancel_btn.setObjectName("iconSecondary")
-        self._cancel_btn.setFixedSize(28, 28)
-        self._cancel_btn.setToolTip("Cancel")
-        self._cancel_btn.clicked.connect(self._on_cancel)
+        self._cancel_btn = icon_button(
+            "✕", tooltip="Cancel", on_click=self._on_cancel
+        )
         progress_row.addWidget(self._cancel_btn)
 
         self._progress_widget.setVisible(False)
@@ -137,6 +135,15 @@ class HealthReportContent(QWidget):
 
     def _kick_off(self, mode: str) -> None:
         if self._is_busy():
+            return
+        # Refuse to start while another LLM-using worker (parsing,
+        # chat, trends extraction) is on the single-slot llama-server.
+        # A queued request would look frozen to the user for minutes.
+        if self.busy_check is not None and self.busy_check():
+            self._status_label.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
             return
         if mode == "full" and not list_uploaded_documents():
             self._status_label.setText("Upload at least one document first.")
@@ -236,11 +243,8 @@ class HealthReportContent(QWidget):
 
         elapsed = max(time.monotonic() - self._gen_start_monotonic, 1e-3)
         rate = self._token_count / elapsed
-        remaining = max(0, self._token_max - self._token_count)
-        eta = remaining / rate if rate > 0 else 0
         self._status_label.setText(
-            f"{self._mode_label}: {self._token_count} / {self._token_max} tokens "
-            f"• {rate:.1f} tok/s • ~{_format_time(eta)} left"
+            f"{self._mode_label}: {self._token_count} tokens • {rate:.1f} tok/s"
         )
 
     def _on_finished(self) -> None:
@@ -279,7 +283,7 @@ class HealthReportContent(QWidget):
         has_new = bool(new_documents_since_last_report())
 
         self._generate_btn.setEnabled(not busy and has_docs)
-        self._update_btn.setEnabled(not busy and has_report and has_new)
+        self._refresh_btn.setEnabled(not busy and has_report and has_new)
         self._delete_btn.setEnabled(not busy and has_report)
         self._download_btn.setEnabled(not busy and has_report)
 

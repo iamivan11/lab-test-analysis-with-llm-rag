@@ -6,10 +6,8 @@ Pipeline:
 3. Retrieve via cosine similarity search
 """
 
-import re
 import shutil
 import threading
-from pathlib import Path
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -35,6 +33,12 @@ TOP_K = KB_TOP_K
 
 _embedder: SentenceTransformer | None = None
 _client: chromadb.ClientAPI | None = None
+# Guards both the lazy-load of the SentenceTransformer AND every
+# .encode() call against it. SentenceTransformer is NOT thread-safe:
+# concurrent encode() from IndexWorker (parsing) and LLMWorker (RAG
+# retrieval during chat) corrupts the shared PyTorch state and crashes
+# the process silently. Holding the lock for the full encode call
+# serialises them at the cost of brief waits.
 _embedder_lock = threading.Lock()
 _client_lock = threading.Lock()
 
@@ -62,6 +66,10 @@ def _get_embedder() -> SentenceTransformer:
     with _embedder_lock:
         if _embedder is None:
             log("KB", f"Loading embedding model {EMBEDDING_MODEL}...")
+            # No cache_folder: HF_HOME from config.py is the single
+            # source of truth for the cache path. Mixing cache_folder
+            # here with snapshot_download elsewhere risked the prefetch
+            # writing one place while this loader read another.
             _embedder = SentenceTransformer(
                 EMBEDDING_MODEL,
                 **_sentence_transformer_kwargs(EMBEDDING_MODEL),
@@ -148,37 +156,6 @@ def chunk_document(
     return chunks
 
 
-def _extract_date_from_text(text: str) -> str:
-    """Extract the report date from labeled date fields in the document."""
-    labeled_patterns = [
-        r"Collection Date\s*:\s*(.+?)(?:\n|$)",
-        r"Received\s*:\s*(.+?)(?:\n|$)",
-        r"Verified\s*:\s*(.+?)(?:\n|$)",
-        r"(?:Дата регистрации|Дата выполнения|Дата и время|Дата исследования)\s*:?\s*(.+?)(?:\n|$)",
-        r"Report Date\s*:\s*(.+?)(?:\n|$)",
-        r"(?<!\w)Date\s*:\s*(.+?)(?:\n|$)",
-    ]
-    for pattern in labeled_patterns:
-        m = re.search(pattern, text[:800], re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            date_match = re.match(
-                r"(\d{1,2}[/.-]\w{3,}[/.-]\d{4}|\w{3}\s+\d{2}\s+\d{4}|\d{2}[/.]\d{2}[/.]\d{4}|\d{4}-\d{2}-\d{2})",
-                val,
-            )
-            return date_match.group(1) if date_match else val
-    return ""
-
-
-def _extract_date_from_filename(filename: str) -> str:
-    """Try to extract date from filename like bt1_20012026.pdf -> 20/01/2026."""
-    m = re.search(r"(\d{8})", filename)
-    if m:
-        digits = m.group(1)
-        return f"{digits[:2]}/{digits[2:4]}/{digits[4:]}"
-    return ""
-
-
 # ── Indexing ───────────────────────────────────────────────────────────
 
 
@@ -218,11 +195,12 @@ def index_document(
         on_progress(f"Embedding {len(chunks)} chunks...")
 
     model = _get_embedder()
-    embeddings = model.encode(
-        texts,
-        show_progress_bar=False,
-        **_document_encode_kwargs(EMBEDDING_MODEL),
-    ).tolist()
+    with _embedder_lock:
+        embeddings = model.encode(
+            texts,
+            show_progress_bar=False,
+            **_document_encode_kwargs(EMBEDDING_MODEL),
+        ).tolist()
 
     if on_progress:
         on_progress(f"Storing {len(chunks)} chunks...")
@@ -276,11 +254,12 @@ def retrieve(query: str, top_k: int = TOP_K) -> list[dict]:
         return []
 
     model = _get_embedder()
-    query_embedding = model.encode(
-        [query],
-        show_progress_bar=False,
-        **_query_encode_kwargs(EMBEDDING_MODEL),
-    ).tolist()
+    with _embedder_lock:
+        query_embedding = model.encode(
+            [query],
+            show_progress_bar=False,
+            **_query_encode_kwargs(EMBEDDING_MODEL),
+        ).tolist()
     results = collection.query(
         query_embeddings=query_embedding,
         n_results=min(top_k, count),
@@ -318,28 +297,3 @@ def list_indexed_documents() -> list[str]:
     return sorted(set(m["source"] for m in all_meta))
 
 
-def prune_orphaned_indexed_documents() -> list[str]:
-    """Remove indexed sources that no longer exist in DOCS_DIR."""
-    indexed = set(list_indexed_documents())
-    existing = {
-        f.name for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")
-    }
-    orphaned = sorted(indexed - existing)
-    if not orphaned:
-        return []
-
-    collection = _get_collection()
-    for filename in orphaned:
-        _remove_by_source(collection, filename)
-        log("KB", f"Pruned orphaned indexed source: {filename}")
-    return orphaned
-
-
-def get_unindexed_documents() -> list[Path]:
-    """Return documents in DOCS_DIR that are not yet indexed."""
-    indexed = set(list_indexed_documents())
-    unindexed = []
-    for f in DOCS_DIR.iterdir():
-        if f.is_file() and not f.name.startswith(".") and f.name not in indexed:
-            unindexed.append(f)
-    return sorted(unindexed, key=lambda f: f.name.lower())

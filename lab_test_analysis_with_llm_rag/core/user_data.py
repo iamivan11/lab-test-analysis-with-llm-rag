@@ -14,6 +14,7 @@ from config import (
     _load_settings,
     _save_settings,
 )
+from core.logger import log
 
 
 def _clear_path(path: Path) -> None:
@@ -47,3 +48,32 @@ def clear_user_data() -> None:
     settings = _load_settings()
     settings.pop("profile", None)
     _save_settings(settings)
+
+
+def purge_document_artifacts(filename: str) -> None:
+    """Remove every cross-subsystem trace of an uploaded document.
+
+    Called whenever a document leaves the user's library — explicit
+    delete, batch delete, parse-failure cleanup, cancellation cleanup.
+    Keeps deletion holistic so stale chunks / cached biomarkers / old
+    report-metadata entries don't outlive their source file.
+    """
+    from core.biomarkers.store import remove_from_cache
+    from core.health_report import remove_from_metadata
+    from core.knowledge_base import remove_document
+
+    remove_document(filename)
+
+    stem = Path(filename).stem
+    for path in (
+        PARSING_OUTPUT_DIR / f"{stem}.md",
+        FILTERING_OUTPUT_DIR / f"{stem}.md",
+        FILTERING_OUTPUT_DIR / f"{stem}.meta.json",
+    ):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            log("DOCS", f"Failed to remove {path}: {e}")
+
+    remove_from_cache(filename)
+    remove_from_metadata(filename)

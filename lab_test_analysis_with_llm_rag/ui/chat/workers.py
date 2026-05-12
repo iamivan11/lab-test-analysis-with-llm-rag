@@ -1,12 +1,11 @@
-import threading
-
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Signal
 
 from core.llm_engine import generate_stream, summarize_history
-from core.logger import log
+from core.logger import log, log_exception
+from core.qthread_utils import StoppableQThread
 
 
-class LLMWorker(QThread):
+class LLMWorker(StoppableQThread):
     thinking_token = Signal(str)
     response_token = Signal(str)
     finished_generation = Signal()
@@ -27,10 +26,6 @@ class LLMWorker(QThread):
         self.max_tokens = max_tokens
         self.use_rag = use_rag
         self.answer_detail = answer_detail
-        self._stop_event = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
 
     def run(self):
         log(
@@ -65,26 +60,26 @@ class LLMWorker(QThread):
                 log("WORKER", f"LLMWorker: finished, {token_count} tokens emitted")
                 self.finished_generation.emit()
         except Exception as e:
-            log("WORKER", f"LLMWorker: ERROR {e}")
+            if self._stop_event.is_set():
+                log("WORKER", f"LLMWorker: cancelled via exception ({e})")
+                self.cancelled_generation.emit()
+                return
+            log_exception("WORKER", "LLMWorker failed")
             self.error_occurred.emit(str(e))
 
 
-class CompressionWorker(QThread):
+class CompressionWorker(StoppableQThread):
     finished = Signal(str)
     error_occurred = Signal(str)
 
     def __init__(self, history: list[dict]):
         super().__init__()
         self.history = history
-        self._stop_event = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
 
     def run(self):
         log("WORKER", f"CompressionWorker: compressing {len(self.history)} messages")
         try:
-            summary = summarize_history(self.history)
+            summary = summarize_history(self.history, stop_event=self._stop_event)
             if self._stop_event.is_set():
                 log("WORKER", "CompressionWorker: cancelled after summary, skipping emit")
                 return
@@ -94,5 +89,5 @@ class CompressionWorker(QThread):
             if self._stop_event.is_set():
                 log("WORKER", f"CompressionWorker: cancelled, swallowing error: {e}")
                 return
-            log("WORKER", f"CompressionWorker: ERROR {e}")
+            log_exception("WORKER", "CompressionWorker failed")
             self.error_occurred.emit(str(e))

@@ -16,14 +16,40 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import DOCS_DIR, format_size, save_model_path
+from config import DOCS_DIR, format_size, list_uploaded_doc_paths, save_model_path
 from core.document_parser import SUPPORTED_EXTENSIONS
-from core.knowledge_base import remove_document
+from core.knowledge_base import list_indexed_documents
 from core.logger import log
+from core.user_data import purge_document_artifacts
+from core.messages import (
+    DOCS_COULD_NOT_DELETE_SINGLE,
+    DOCS_COULD_NOT_REMOVE_BATCH,
+    INDEXING_FAILED,
+    REINDEX_FAILED_BATCH,
+    REINDEX_FAILED_SINGLE,
+)
 from core.security import write_protected_bytes
+
+
+def _safe_unlink(path: Path) -> tuple[bool, str | None]:
+    """Try to delete `path`. Returns (success, error_message_or_None).
+
+    Surfacing the OS error is critical: an earlier silent
+    `path.unlink(missing_ok=True)` would let permission/ENOENT failures
+    pass while the UI cheerfully claimed "Deleted: X" — leaving the
+    document permanently in the list.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return True, None
+    except OSError as e:
+        log("DOCS", f"Failed to delete {path}: {e}")
+        return False, str(e)
+    return True, None
+from ui.components import icon_button
 from ui.documents.workers import (
     FILTERING_OUTPUT_DIR,
-    PARSING_OUTPUT_DIR,
     EnsureVisionModelWorker,
     IndexWorker,
 )
@@ -35,9 +61,22 @@ class DocumentsHubWidget(QWidget):
     model_swapped = Signal(str, str)
     parsing_active_changed = Signal(bool)
     docs_changed = Signal()
+    # (status_text, is_active) — fired at every reindex state transition
+    # so peer UIs (Settings → Reindex button) can mirror progress without
+    # the user having to navigate to the Documents tab to know what's
+    # happening.
+    reindex_status_changed = Signal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Injected by main_window so document mutations (delete, delete
+        # all) can refuse while another LLM-using worker is reading the
+        # filtered text / chunks of these docs — Trends extraction and
+        # Health Report iterate over uploaded docs, and chat retrieval
+        # queries chunks from chromadb.
+        from collections.abc import Callable
+
+        self.busy_check: Callable[[], bool] | None = None
         self._index_worker = None
         self._ensure_worker = None
         self._pending_files: list[Path] = []
@@ -87,11 +126,9 @@ class DocumentsHubWidget(QWidget):
         self._progress_bar.setFormat("%v / %m files")
         progress_row.addWidget(self._progress_bar, stretch=1)
 
-        self._cancel_btn = QPushButton("✕")
-        self._cancel_btn.setObjectName("iconSecondary")
-        self._cancel_btn.setFixedSize(28, 28)
-        self._cancel_btn.setToolTip("Cancel")
-        self._cancel_btn.clicked.connect(self._cancel_current)
+        self._cancel_btn = icon_button(
+            "✕", tooltip="Cancel", on_click=self._cancel_current
+        )
         progress_row.addWidget(self._cancel_btn)
 
         self._progress_widget.setVisible(False)
@@ -118,12 +155,19 @@ class DocumentsHubWidget(QWidget):
         self._refresh_source_list()
 
     def _refresh_source_list(self):
-        files = sorted(
-            [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")],
-            key=lambda f: f.name.lower(),
-        )
+        # Show only documents that are actually in the vector DB. Files
+        # that are on disk but mid-parse haven't been indexed yet —
+        # surfacing them as if they were ready misleads the user (the
+        # status would say "30 document(s)" while none are searchable).
+        indexed = set(list_indexed_documents())
+        files = [p for p in list_uploaded_doc_paths() if p.name in indexed]
         self._populate_table(files, deletable=True)
-        self._status.setText(f"{len(files)} document(s)")
+        # Don't clobber the parsing-progress status when an indexing or
+        # vision-model-load operation is in flight. Tab navigation away
+        # and back would otherwise replace "Parsing P-001..." with
+        # "30 document(s)" — confusing while a bar is still moving.
+        if not self.is_busy():
+            self._status.setText(f"{len(files)} document(s)")
         self._delete_all_btn.setEnabled(len(files) > 0)
         self.docs_changed.emit()
 
@@ -146,11 +190,11 @@ class DocumentsHubWidget(QWidget):
             self._table.setItem(row, 1, size_item)
 
             if deletable:
-                del_btn = QPushButton("−")  # noqa: RUF001 - UI glyph, not arithmetic.
-                del_btn.setObjectName("iconSecondary")
-                del_btn.setFixedSize(28, 28)
-                del_btn.setToolTip("Delete")
-                del_btn.clicked.connect(lambda checked, path=file_path: self._delete_file(path))
+                del_btn = icon_button(
+                    "−",  # noqa: RUF001 - UI glyph, not arithmetic.
+                    tooltip="Delete",
+                    on_click=lambda path=file_path: self._delete_file(path),
+                )
                 self._table.setCellWidget(row, 2, del_btn)
             else:
                 self._table.setCellWidget(row, 2, None)
@@ -240,23 +284,45 @@ class DocumentsHubWidget(QWidget):
         self._progress_widget.setVisible(True)
         self._status.setText("Reindexing from saved filtered results...")
         self.parsing_active_changed.emit(True)
+        self.reindex_status_changed.emit(
+            f"Reindexing {len(file_paths)} document(s)...", True
+        )
 
         self._index_worker = IndexWorker(file_paths, reuse_filtered=True)
         self._wire_index_worker(token)
         self._index_worker.start()
 
     def reindex_files(self):
-        files = sorted(
-            [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")],
-            key=lambda f: f.name.lower(),
-        )
+        # Edge case: another reindex/parse already running. Surface that
+        # to peer UIs (Settings) so the click feels responsive even if
+        # we don't actually start a second worker. We keep `active=False`
+        # in the "already in progress" branches so the Settings button
+        # doesn't get stuck disabled — the in-flight worker is owned by
+        # a different code path and won't fire a reindex completion to
+        # re-enable it.
+        if self._index_worker and self._index_worker.isRunning():
+            self.reindex_status_changed.emit(
+                "Indexing already in progress; try again when it finishes.", False
+            )
+            return
+        if self._ensure_worker and self._ensure_worker.isRunning():
+            self.reindex_status_changed.emit(
+                "Vision model is still loading; try again in a moment.", False
+            )
+            return
+
+        files = list_uploaded_doc_paths()
         if not files:
             self._status.setText("No documents to reindex")
+            self.reindex_status_changed.emit("No documents to reindex.", False)
             return
 
         missing = [f.name for f in files if not (FILTERING_OUTPUT_DIR / f"{f.stem}.md").exists()]
         if missing:
             self._status.setText(f"Missing filtered results for {len(missing)} document(s)")
+            self.reindex_status_changed.emit(
+                f"Missing filtered results for {len(missing)} document(s).", False
+            )
             return
 
         self._start_reindexing(files)
@@ -274,15 +340,20 @@ class DocumentsHubWidget(QWidget):
             self._index_worker.stop()
 
     def _cleanup_batch(self):
+        failures: list[str] = []
         for path in self._current_batch:
-            remove_document(path.name)
-            path.unlink(missing_ok=True)
-            raw_md_path = PARSING_OUTPUT_DIR / f"{path.stem}.md"
-            filtered_md_path = FILTERING_OUTPUT_DIR / f"{path.stem}.md"
-            raw_md_path.unlink(missing_ok=True)
-            filtered_md_path.unlink(missing_ok=True)
+            purge_document_artifacts(path.name)
+            ok, err = _safe_unlink(path)
+            if not ok:
+                failures.append(f"{path.name}: {err}")
             log("DOCS", f"Cleaned up cancelled file: {path.name}")
         self._current_batch = []
+        if failures:
+            self._status.setText(
+                DOCS_COULD_NOT_REMOVE_BATCH.format(
+                    count=len(failures), first=failures[0]
+                )
+            )
 
     def _finalize_parsing(self, status_text: str):
         self._progress_widget.setVisible(False)
@@ -350,58 +421,131 @@ class DocumentsHubWidget(QWidget):
         if not self._is_current_operation(token):
             return
         self._progress_bar.setValue(done)
+        if self._reindex_active:
+            self.reindex_status_changed.emit(
+                f"Reindexing document {done}/{total}...", True
+            )
 
     def _on_files_failed(self, token: int, failed: list[Path]):
         if not self._is_current_operation(token):
             return
         if self._reindex_active:
             self._refresh_list()
-            self._status.setText(f"Reindex failed for {len(failed)} document(s)")
+            msg = REINDEX_FAILED_BATCH.format(count=len(failed))
+            self._status.setText(msg)
+            self.reindex_status_changed.emit(msg, False)
             return
+        unlink_failures: list[str] = []
         for path in failed:
-            remove_document(path.name)
-            path.unlink(missing_ok=True)
-            log("DOCS", f"Removed failed file: {path.name}")
+            purge_document_artifacts(path.name)
+            ok, err = _safe_unlink(path)
+            if ok:
+                log("DOCS", f"Removed failed file: {path.name}")
+            else:
+                log("DOCS", f"Could not remove failed file {path.name}: {err}")
+                unlink_failures.append(f"{path.name}: {err}")
         self._refresh_list()
+        # _refresh_list resets status to "N document(s)"; surface the
+        # unlink failures after so the user sees why orphaned files
+        # might still be in DOCS_DIR (e.g. permission issue).
+        if unlink_failures:
+            self._status.setText(
+                DOCS_COULD_NOT_REMOVE_BATCH.format(
+                    count=len(unlink_failures), first=unlink_failures[0]
+                )
+            )
 
     def _on_index_done(self, token: int, total_chunks: int, cancelled: bool):
         if not self._is_current_operation(token):
             return
         log("DOCS", f"Indexing complete: {total_chunks} chunks stored, cancelled={cancelled}")
+        was_reindex = self._reindex_active
         if cancelled:
             self._cleanup_batch()
             self._finalize_parsing("Parsing cancelled — all files dropped")
+            if was_reindex:
+                self.reindex_status_changed.emit("Reindex cancelled.", False)
         else:
             self._current_batch = []
             self._finalize_parsing(f"Indexing complete — {total_chunks} chunks stored")
+            if was_reindex:
+                self.reindex_status_changed.emit(
+                    f"Reindex complete — {total_chunks} chunks stored.", False
+                )
 
     def _on_index_error(self, token: int, error: str):
         if not self._is_current_operation(token):
             return
         log("DOCS", f"Indexing error: {error}")
+        was_reindex = self._reindex_active
         if self._cancelled:
             self._cleanup_batch()
             self._finalize_parsing("Parsing cancelled")
+            if was_reindex:
+                self.reindex_status_changed.emit("Reindex cancelled.", False)
         else:
             self._current_batch = []
-            self._finalize_parsing(f"Error: {error}")
+            self._finalize_parsing(INDEXING_FAILED.format(error=error))
+            if was_reindex:
+                self.reindex_status_changed.emit(
+                    REINDEX_FAILED_SINGLE.format(error=error), False
+                )
 
     def _delete_file(self, path: Path):
+        # Refuse delete while ANY LLM-using worker is reading these docs:
+        #  - parse/reindex (own IndexWorker) writes chunks for this file
+        #  - Trends extraction iterates uploaded filtered markdown
+        #  - Health Report reads uploaded filtered markdown
+        #  - Chat RAG retrieval queries chunks from chromadb
+        # Pulling a doc out mid-flight leaves phantom chunks or silently
+        # produces an incomplete extraction.
+        if self.is_busy() or (self.busy_check is not None and self.busy_check()):
+            self._status.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         log("DOCS", f"Deleting document: {path.name}")
-        remove_document(path.name)
-        path.unlink(missing_ok=True)
+        purge_document_artifacts(path.name)
+        ok, err = _safe_unlink(path)
         self._table_signature = None
-        self._status.setText(f"Deleted: {path.name}")
+        if ok:
+            self._status.setText(f"Deleted: {path.name}")
+        else:
+            self._status.setText(
+                DOCS_COULD_NOT_DELETE_SINGLE.format(name=path.name, err=err)
+            )
         self._refresh_list()
 
     def _delete_all(self):
+        # The Delete-All button is already disabled during the local
+        # parse/reindex, but Trends/Health Report iterate the same docs
+        # without disabling it. Same guard as _delete_file.
+        if self.is_busy() or (self.busy_check is not None and self.busy_check()):
+            self._status.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         log("DOCS", "Deleting all documents")
-        files = [f for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")]
+        files = list_uploaded_doc_paths()
+        deleted = 0
+        failures: list[str] = []
         for file_path in files:
-            remove_document(file_path.name)
-            file_path.unlink(missing_ok=True)
+            purge_document_artifacts(file_path.name)
+            ok, err = _safe_unlink(file_path)
+            if ok:
+                deleted += 1
+            else:
+                failures.append(f"{file_path.name}: {err}")
         self._table_signature = None
-        self._status.setText(f"Deleted {len(files)} document(s)")
+        if failures:
+            self._status.setText(
+                f"Deleted {deleted}/{len(files)}; "
+                f"failed: {failures[0]}"
+            )
+        else:
+            self._status.setText(f"Deleted {deleted} document(s)")
         self._refresh_list()
 
 

@@ -1,11 +1,10 @@
 import json
 import tempfile
-import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Signal
 
 from config import (
     FILTERING_OUTPUT_DIR,
@@ -20,9 +19,10 @@ from config import (
 from core.document_parser import extract_document_metadata, parse_document, set_save_dirs
 from core.knowledge_base import index_document, remove_document
 from core.llm_engine import SERVER_URL, get_current_model_path, is_server_running, start_server
-from core.logger import log
+from core.logger import log, log_exception
 from core.model_hub import ensure_default_model
 from core.model_meta import read_model_meta
+from core.qthread_utils import StoppableQThread
 from core.security import (
     read_protected_bytes,
     read_protected_json,
@@ -39,21 +39,17 @@ def format_eta(seconds: float) -> str:
     return f"{minutes}m {rem_seconds:02d}s"
 
 
-def _empty_metadata() -> dict[str, str]:
-    return {"report_date": "", "report_type": ""}
-
-
 def _metadata_cache_path(path: Path) -> Path:
     return FILTERING_OUTPUT_DIR / f"{path.stem}.meta.json"
+
+
+_METADATA_KEYS = ("report_date", "report_type")
 
 
 def _normalize_metadata(raw: object) -> dict[str, str] | None:
     if not isinstance(raw, dict):
         return None
-    return {
-        "report_date": str(raw.get("report_date", "")).strip(),
-        "report_type": str(raw.get("report_type", "")).strip(),
-    }
+    return {k: str(raw.get(k, "")).strip() for k in _METADATA_KEYS}
 
 
 def _load_cached_metadata(path: Path) -> dict[str, str] | None:
@@ -79,6 +75,7 @@ def _extract_or_load_metadata(
     markdown: str,
     *,
     reuse_filtered: bool,
+    stop_event=None,
 ) -> dict[str, str]:
     if reuse_filtered:
         cached = _load_cached_metadata(path)
@@ -87,10 +84,14 @@ def _extract_or_load_metadata(
             return cached
 
     try:
-        metadata = extract_document_metadata(markdown, server_url=SERVER_URL)
+        metadata = extract_document_metadata(
+            markdown, server_url=SERVER_URL, stop_event=stop_event
+        )
+    except InterruptedError:
+        raise
     except Exception as e:
         log("WORKER", f"IndexWorker: metadata extraction failed for {path.name}: {e}")
-        return _empty_metadata()
+        return _normalize_metadata({})
 
     _save_cached_metadata(path, metadata)
     return metadata
@@ -104,17 +105,10 @@ def _readable_source_document(path: Path):
         yield readable_path
 
 
-class EnsureVisionModelWorker(QThread):
+class EnsureVisionModelWorker(StoppableQThread):
     progress = Signal(str)
     finished = Signal(str, str)
     error_occurred = Signal(str)
-
-    def __init__(self):
-        super().__init__()
-        self._stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self._stop_event.set()
 
     def _display_name(self, model_path: str) -> str:
         if model := approved_model_for_file(model_path):
@@ -164,11 +158,18 @@ class EnsureVisionModelWorker(QThread):
             log("DOCS", f"Vision model ready: {model_path} ({name})")
             self.finished.emit(model_path, name)
         except Exception as e:
-            log("DOCS", f"EnsureVisionModelWorker: ERROR {e}")
+            if self._stop_event.is_set():
+                log("DOCS", f"EnsureVisionModelWorker: cancelled via exception ({e})")
+                # The host (IndexWorker pipeline) treats an empty
+                # model_path as "user cancelled" — same path as the
+                # explicit cancel check above.
+                self.finished.emit("", "")
+                return
+            log_exception("DOCS", "EnsureVisionModelWorker failed")
             self.error_occurred.emit(str(e))
 
 
-class IndexWorker(QThread):
+class IndexWorker(StoppableQThread):
     progress = Signal(str)
     file_progress = Signal(int, int)
     finished = Signal(int, bool)
@@ -179,10 +180,6 @@ class IndexWorker(QThread):
         super().__init__()
         self.file_paths = file_paths
         self.reuse_filtered = reuse_filtered
-        self._stop_event = threading.Event()
-
-    def stop(self) -> None:
-        self._stop_event.set()
 
     def is_stopped(self) -> bool:
         return self._stop_event.is_set()
@@ -223,14 +220,31 @@ class IndexWorker(QThread):
                         markdown = read_protected_text(filtered_path)
                     else:
                         with _readable_source_document(path) as readable_path:
-                            markdown = parse_document(str(readable_path), server_url=SERVER_URL)
+                            markdown = parse_document(
+                                str(readable_path),
+                                server_url=SERVER_URL,
+                                stop_event=self._stop_event,
+                            )
                     metadata = _extract_or_load_metadata(
                         path,
                         markdown,
                         reuse_filtered=self.reuse_filtered,
+                        stop_event=self._stop_event,
                     )
                     log("WORKER", f"IndexWorker: parsed {path.name}, {len(markdown)} chars")
+                except InterruptedError:
+                    log("WORKER", f"IndexWorker: cancelled mid-parse on {path.name}")
+                    break
                 except Exception as e:
+                    # Cancellation can also surface as a generic exception
+                    # (e.g. an httpx error if the cancel watcher won the
+                    # race). Always recheck stop_event before treating a
+                    # failure as "this file's fault" — otherwise the UI
+                    # gets stuck on "Cancelling..." until every remaining
+                    # file is also attempted and fails.
+                    if self.is_stopped():
+                        log("WORKER", f"IndexWorker: cancelled during {path.name} ({e})")
+                        break
                     log("WORKER", f"IndexWorker: FAILED to parse {path.name}: {e}")
                     failed.append(path)
                     continue
@@ -252,6 +266,9 @@ class IndexWorker(QThread):
                     indexed.append(path)
                     log("WORKER", f"IndexWorker: indexed {path.name}, {chunks} chunks")
                 except Exception as e:
+                    if self.is_stopped():
+                        log("WORKER", f"IndexWorker: cancelled during index of {path.name} ({e})")
+                        break
                     log("WORKER", f"IndexWorker: FAILED to index {path.name}: {e}")
                     failed.append(path)
 
@@ -281,8 +298,15 @@ class IndexWorker(QThread):
                 self.failed_files.emit(failed)
             self.finished.emit(total_chunks, self.is_stopped())
         except Exception as e:
-            log("WORKER", f"IndexWorker: ERROR {e}")
+            log_exception("WORKER", "IndexWorker failed")
             self.error_occurred.emit(str(e))
         finally:
+            # Suppress cleanup-time failures so they can't mask the real
+            # exception we'd otherwise propagate through error_occurred —
+            # an uncaught raise in `finally` shadows the original error
+            # and leaves the UI waiting on a signal that never fires.
             if not self.reuse_filtered:
-                set_save_dirs(None, None)
+                try:
+                    set_save_dirs(None, None)
+                except Exception as e:
+                    log("WORKER", f"IndexWorker: cleanup failed (suppressed): {e}")

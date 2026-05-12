@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 
 from config import (
     APP_NAME,
-    DOCS_DIR,
+    list_uploaded_doc_paths,
     is_onboarding_complete,
     save_model_path,
     set_onboarding_complete,
@@ -26,7 +26,8 @@ from core.security import (
     unlock,
 )
 from ui.chat import ChatController
-from ui.chat.widgets import AutoHideScrollListWidget, ChatDisplayBrowser, PlainTextPasteEdit
+from ui.chat.view import AutoHideScrollListWidget, ChatDisplayBrowser, PlainTextPasteEdit
+from ui.components import CHIP_STYLE, BroadcastLabel, StatsBar, TimedStatusLabel
 from ui.documents import DocumentsController
 from ui.models import ModelController
 from ui.onboarding import (
@@ -37,7 +38,7 @@ from ui.onboarding import (
 )
 from ui.profile import ProfileController
 from ui.screens import HomeScreen
-from ui.security_unlock import UnlockScreen
+from ui.security import UnlockScreen
 from ui.styles import STYLESHEET
 
 
@@ -66,7 +67,14 @@ def _wait_worker_stopped(label: str, worker, timeout_ms: int = 3000) -> bool:
 
 
 class MainWindow(QMainWindow):
-    SHUTDOWN_WAIT_MS = 3000
+    # Per-worker wait timeout during close. Kept tight: most workers
+    # respond to stop_event in <1s; long waits make the app look frozen
+    # to macOS Window Server, which then prompts force-quit — and an
+    # abrupt force-quit while llama-server is mid-Metal-shutdown has
+    # been observed to wedge the GPU subsystem. The retry loop below
+    # picks up any worker that didn't make this window, so a tight cap
+    # here doesn't lose work — it just unfreezes the UI sooner.
+    SHUTDOWN_WAIT_MS = 500
     SHUTDOWN_RETRY_MS = 250
 
     def __init__(self, *, start_locked: bool = False):
@@ -163,7 +171,8 @@ class MainWindow(QMainWindow):
         self._wire_screens()
         self._init_chat()
 
-        if is_onboarding_complete():
+        # DEV: force onboarding on every launch.
+        if False and is_onboarding_complete():
             self._stack.setCurrentWidget(self._home_screen)
             self._try_load_saved_model()
         else:
@@ -190,6 +199,20 @@ class MainWindow(QMainWindow):
         self._home_screen.documents.docs_changed.connect(self._update_use_docs_state)
         self._home_screen.model_hub.load_requested.connect(self._on_hub_load_requested)
         self._home_screen.model_hub.loaded_model_deleted.connect(self._ensure_default_model)
+        # Source-of-truth for "is the LLM busy" lives here — every widget
+        # that triggers a long LLM call (or wipes shared state) consults
+        # this before proceeding, so the user gets an immediate "wait or
+        # cancel" message instead of a queued request that looks frozen.
+        self._home_screen._settings_form.busy_check = self.is_llm_busy
+        self._home_screen.trends.busy_check = self.is_llm_busy
+        self._home_screen.health_report.busy_check = self.is_llm_busy
+        self._home_screen.documents.busy_check = self.is_llm_busy
+        self._documents_setup_screen.docs.busy_check = self.is_llm_busy
+        self._home_screen.model_hub.busy_check = self.is_llm_busy
+        self.register_stats_bar(self._home_screen.health_report.stats_bar)
+        self.register_stats_bar(self._home_screen.trends.stats_bar)
+        self.register_general_status_label(self._home_screen.health_report._status_label)
+        self.register_general_status_label(self._home_screen.trends._status)
         self._home_screen._settings_form.user_data_cleared.connect(self._on_user_data_cleared)
         self._home_screen._settings_form.default_model_changed.connect(
             self._on_default_model_changed
@@ -214,11 +237,30 @@ class MainWindow(QMainWindow):
     def _on_documents_setup_proceed(self):
         if self._documents_setup_screen.docs.is_busy():
             return
+        # Persist completion before showing Home so a crash during
+        # _show_home() doesn't drop the user back into onboarding on
+        # next launch despite having finished the flow.
+        self._mark_onboarding_complete()
         self._show_home()
-        QTimer.singleShot(0, self._mark_onboarding_complete)
 
     def _mark_onboarding_complete(self) -> None:
-        set_onboarding_complete(True)
+        try:
+            set_onboarding_complete(True)
+        except Exception as e:
+            # Persistence failed (disk full, settings.json read-only,
+            # etc.) — warn the user but do NOT trap them on the docs
+            # screen. The in-memory state is fine for this session;
+            # they'll just see the welcome flow again next launch.
+            from PySide6.QtWidgets import QMessageBox
+
+            log("APP", f"Failed to mark onboarding complete: {e}")
+            QMessageBox.warning(
+                self,
+                "Could not save onboarding state",
+                "The app couldn't save its progress. You may see the "
+                "welcome screen again on next launch.\n\n"
+                f"Reason: {e}",
+            )
 
     def _show_home(self):
         # Resetting Home to its default tile (Profile) keeps the Back button
@@ -238,7 +280,6 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMessageBox
 
         from config import APPROVED_MODELS, approved_model_file_path
-        from core.llm_engine import get_current_model_path
 
         model = APPROVED_MODELS.get(model_id)
         if not model:
@@ -257,11 +298,12 @@ class MainWindow(QMainWindow):
                 "Open the Models tab and install it to use it as the default.",
             )
             return
-        if get_current_model_path() == str(target_path):
-            log("UI", f"Default model {model_id} already loaded — no reload")
-            return
-        log("UI", f"Switching to new default model {model_id} at {target_path}")
         save_model_path(str(target_path))
+        # Refresh the My Models table so per-row delete buttons reflect
+        # the new default. `_load_model` would normally trigger this on
+        # successful start, but it short-circuits when the new default
+        # is already the loaded model — leaving the table stale.
+        self._home_screen.model_hub.refresh_local()
         self._load_model(str(target_path))
 
     def _on_user_data_cleared(self) -> None:
@@ -330,23 +372,23 @@ class MainWindow(QMainWindow):
         self._sidebar_btn.clicked.connect(self._toggle_sidebar)
         top_row.addWidget(self._sidebar_btn)
 
-        chip_style = (
-            "font-size: 11px; color: #cdd6f4; background: #313244;"
-            "border: 1px solid #45475a; border-radius: 8px;"
-            "padding: 3px 8px;"
-        )
+        chip_style = CHIP_STYLE
 
-        self._status_label = QLabel("No model loaded")
+        # `_status_label` is a BroadcastLabel so peer StatsBars in
+        # Health Report / Trends mirror "Model: X" / "Loading..." text
+        # without changing the many controller call sites that already
+        # write to `_status_label`.
+        self._status_label = BroadcastLabel("No model loaded")
         self._status_label.setStyleSheet(chip_style)
         self._status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_row.addWidget(self._status_label)
 
-        self._mem_chip = QLabel("Memory ...")
+        self._mem_chip = QLabel("Memory: ...")
         self._mem_chip.setStyleSheet(chip_style)
         self._mem_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_row.addWidget(self._mem_chip)
 
-        self._cpu_chip = QLabel("CPU ...")
+        self._cpu_chip = QLabel("CPU: ...")
         self._cpu_chip.setStyleSheet(chip_style)
         self._cpu_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top_row.addWidget(self._cpu_chip)
@@ -364,6 +406,17 @@ class MainWindow(QMainWindow):
         )
         top_row.addWidget(self._ctx_chip)
 
+        # Peer StatsBars (Health Report, Trends) register themselves
+        # here so the 2-second stats tick and context refresh push the
+        # same values out to every section's chips.
+        self._stats_bars: list[StatsBar] = []
+
+        # Peer section-level status labels (Health Report, Trends).
+        # `_set_general_status` fans transient messages out to every
+        # registered label; each one auto-clears 30 s after its last
+        # update via TimedStatusLabel.
+        self._general_status_labels: list[TimedStatusLabel] = []
+
         top_row.addStretch()
 
         main_layout.addLayout(top_row)
@@ -376,9 +429,16 @@ class MainWindow(QMainWindow):
         self._update_ctx_chip()
         self._update_stats()
 
+        # Transient status banner under the chips. All non-model-name
+        # messages (model loading, download progress, "wait or cancel",
+        # errors) flow through `_set_general_status` and land here as
+        # well as in the peer labels in Health Report / Trends.
+        self._general_status_label = TimedStatusLabel("")
+        main_layout.addWidget(self._general_status_label)
+        self._general_status_labels.append(self._general_status_label)
+
         # Chat display
         self._chat_display = ChatDisplayBrowser()
-        self._chat_display.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._chat_display.setReadOnly(True)
         self._chat_display.setOpenLinks(False)
         self._chat_display.setOpenExternalLinks(False)
@@ -551,10 +611,7 @@ class MainWindow(QMainWindow):
     def _update_use_docs_state(self) -> None:
         if not hasattr(self, "_use_docs_btn"):
             return
-        has_docs = any(
-            path.is_file() and not path.name.startswith(".")
-            for path in DOCS_DIR.iterdir()
-        )
+        has_docs = bool(list_uploaded_doc_paths())
         self._use_docs_btn.setEnabled(has_docs)
         if not has_docs:
             self._use_docs_btn.setChecked(False)
@@ -567,14 +624,29 @@ class MainWindow(QMainWindow):
         if not self._app_initialized:
             super().closeEvent(event)
             return
+        # Stop llama-server FIRST. With a multi-billion-parameter model
+        # loaded into unified memory + an active Metal context, this is
+        # the single largest resource the OS has to reclaim. Releasing
+        # it before the per-worker wait loop frees the GPU/RAM in
+        # bounded time (≤2 s), which prevents the laptop-freeze case we
+        # saw: workers blocking the main thread → macOS prompts
+        # force-quit → user kills the app mid-Metal-shutdown → GPU
+        # subsystem wedges.
+        stop_server()
         self._save_current_chat()
         self._cancel_transient_ui_work()
         workers = self._background_workers()
         for _, worker in workers:
             _request_worker_stop(worker)
-        stop_server()
         still_running = []
         for label, worker in workers:
+            # EmbedderPrefetchWorker can't be cancelled (snapshot_download
+            # has no hook). Don't block shutdown waiting for it — Qt's
+            # process exit will reap the daemon thread when the OS sends
+            # SIGTERM. Same for any future worker that ignores stop_event.
+            if "embedder" in label.lower():
+                log("UI", f"Skipping wait on uncancellable worker: {label}")
+                continue
             if not _wait_worker_stopped(label, worker, timeout_ms=self.SHUTDOWN_WAIT_MS):
                 still_running.append(label)
         if still_running:
@@ -626,7 +698,18 @@ class MainWindow(QMainWindow):
 
         workers.extend(
             [
-                ("onboarding model download", self._model_download_screen._worker),
+                (
+                    "onboarding main model download",
+                    self._model_download_screen._model_worker,
+                ),
+                (
+                    "onboarding mmproj download",
+                    self._model_download_screen._mmproj_worker,
+                ),
+                (
+                    "onboarding embedder prefetch",
+                    self._model_download_screen._embedder_worker,
+                ),
                 ("health report", self._home_screen.health_report._worker),
                 ("trends extraction", self._home_screen.trends._worker),
             ]
@@ -637,7 +720,66 @@ class MainWindow(QMainWindow):
             workers.append((f"model hub download {token}", worker))
         return [(label, worker) for label, worker in workers if worker is not None]
 
+    # Labels in _background_workers() that talk to llama-server (i.e.
+    # whose work breaks if the server is stopped or swapped mid-flight).
+    # File downloads, embedder prefetch, and server start/stop itself
+    # are intentionally excluded.
+    _LLM_WORKER_LABEL_HINTS = (
+        "chat generation",
+        "chat compression",
+        "health report",
+        "trends extraction",
+        "indexing",
+        "vision model",
+    )
+
+    def is_llm_busy(self) -> bool:
+        """True if any worker actively driving llama-server is running.
+
+        Used to refuse actions that would pull the server out from under
+        an in-flight request: model swap, Clear User Data wiping
+        DOCS_DIR / FILTERING_OUTPUT_DIR while IndexWorker reads them, etc.
+        """
+        for label, worker in self._background_workers():
+            if not any(hint in label for hint in self._LLM_WORKER_LABEL_HINTS):
+                continue
+            try:
+                if worker.isRunning():
+                    return True
+            except RuntimeError:
+                # QThread was already destroyed — treat as not running.
+                pass
+        return False
+
     # ── System stats ────────────────────────────────────────────────────────
+
+    def register_general_status_label(self, label: TimedStatusLabel) -> None:
+        """Subscribe a section's status label to general broadcasts."""
+        self._general_status_labels.append(label)
+
+    def _set_general_status(self, text: str) -> None:
+        """Fan a transient status message out to every section's status label.
+
+        Used for messages that aren't section-specific — model loading,
+        download progress, busy refusals ("Wait for the current operation
+        to finish..."), server errors. Each label auto-clears 30 s after
+        the last update.
+        """
+        for label in self._general_status_labels:
+            label.setText(text)
+
+    def register_stats_bar(self, bar: StatsBar) -> None:
+        """Subscribe a peer StatsBar to status / mem / cpu / context updates.
+
+        Status mirroring is wired through BroadcastLabel.add_listener so
+        anything that calls `_status_label.setText(...)` (controllers in
+        chat / models) reaches the bar with no other code changes.
+        """
+        self._stats_bars.append(bar)
+        self._status_label.add_listener(bar.set_status)
+        bar.set_memory(self._mem_chip.text())
+        bar.set_cpu(self._cpu_chip.text())
+        bar.set_context(self._ctx_chip.text())
 
     def _update_stats(self):
         import psutil
@@ -645,8 +787,13 @@ class MainWindow(QMainWindow):
         mem = psutil.virtual_memory()
         used_gb = mem.used / (1024**3)
         total_gb = mem.total / (1024**3)
-        self._mem_chip.setText(f"Memory {used_gb:.1f}/{total_gb:.1f} GB")
-        self._cpu_chip.setText(f"CPU {psutil.cpu_percent(interval=None):.0f}%")
+        mem_text = f"Memory: {used_gb:.1f}/{total_gb:.1f} GB"
+        cpu_text = f"CPU: {psutil.cpu_percent(interval=None):.0f}%"
+        self._mem_chip.setText(mem_text)
+        self._cpu_chip.setText(cpu_text)
+        for bar in self._stats_bars:
+            bar.set_memory(mem_text)
+            bar.set_cpu(cpu_text)
 
     @staticmethod
     def _format_token_count(n: int) -> str:
@@ -686,10 +833,13 @@ class MainWindow(QMainWindow):
         used = history_chars // 3 + 500
         used = min(used, n_ctx)
 
-        self._ctx_chip.setText(
+        ctx_text = (
             f"Context: {self._format_token_count(used)}/"
             f"{self._format_token_count(n_ctx)}"
         )
+        self._ctx_chip.setText(ctx_text)
+        for bar in self._stats_bars:
+            bar.set_context(ctx_text)
 
     # ── Profile / app actions ──────────────────────────────────────────────
 
@@ -733,9 +883,6 @@ class MainWindow(QMainWindow):
 
     def _send_message(self):
         self._chat_controller.send_message()
-
-    def _reply_chat_disabled(self):
-        self._chat_controller.reply_chat_disabled()
 
     def _launch_llm_worker(self, context: str = ""):
         self._chat_controller.launch_llm_worker(context)

@@ -49,7 +49,7 @@ def rag_token_budget(ctx_size: int) -> int:
     return int(ctx_size * 0.33)
 
 
-def count_tokens(text: str, server_url: str = SERVER_URL) -> int:
+def count_tokens(text: str, server_url: str = SERVER_URL, stop_event=None) -> int:
     if server_url == SERVER_URL and text in _token_count_cache:
         return _token_count_cache[text]
 
@@ -57,6 +57,7 @@ def count_tokens(text: str, server_url: str = SERVER_URL) -> int:
         f"{server_url}/tokenize",
         json={"content": text},
         timeout=LLM_TOKENIZE_TIMEOUT_SECONDS,
+        stop_event=stop_event,
     )
     r.raise_for_status()
     token_count = len(r.json().get("tokens", []))
@@ -82,14 +83,18 @@ def _format_chunk_for_context(chunk: dict) -> str:
 
 
 def _pack_chunks_by_tokens(
-    chunks: list[dict], ctx_size: int, max_tokens: int | None = None
+    chunks: list[dict],
+    ctx_size: int,
+    max_tokens: int | None = None,
+    *,
+    stop_event=None,
 ) -> tuple[list[str], int]:
     max_tokens = rag_token_budget(ctx_size) if max_tokens is None else max_tokens
     if max_tokens <= 0:
         return [], 0
     separator = "\n\n---\n\n"
     try:
-        sep_tokens = count_tokens(separator)
+        sep_tokens = count_tokens(separator, stop_event=stop_event)
     except Exception as e:
         log("RAG", f"Tokenizer unavailable ({e}); falling back to char budget")
         return _pack_chunks_by_chars(chunks, max_tokens * 3)
@@ -99,7 +104,7 @@ def _pack_chunks_by_tokens(
     for chunk in chunks:
         entry = _format_chunk_for_context(chunk)
         try:
-            entry_tokens = count_tokens(entry)
+            entry_tokens = count_tokens(entry, stop_event=stop_event)
         except Exception as e:
             log("RAG", f"Tokenizer failed mid-pack ({e}); falling back to char budget")
             return _pack_chunks_by_chars(chunks, max_tokens * 3)
@@ -126,7 +131,7 @@ def _pack_chunks_by_chars(chunks: list[dict], max_chars: int) -> tuple[list[str]
     return entries, total
 
 
-def _compress_rag_context(query: str, context: str) -> str:
+def _compress_rag_context(query: str, context: str, *, stop_event=None) -> str:
     if not context.strip():
         return context
 
@@ -146,6 +151,7 @@ def _compress_rag_context(query: str, context: str) -> str:
             "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=LLM_RAG_COMPRESSION_TIMEOUT_SECONDS,
+        stop_event=stop_event,
     )
     response.raise_for_status()
     message = response.json()["choices"][0]["message"]
@@ -246,7 +252,10 @@ def _build_hyde_retrieval_query(
 
 
 def _retrieve_rag_context(
-    history: list[dict], token_budget: int | None = None
+    history: list[dict],
+    token_budget: int | None = None,
+    *,
+    stop_event=None,
 ) -> tuple[str, bool]:
     log("RAG", "Retrieving context from knowledge base...")
     try:
@@ -278,12 +287,13 @@ def _retrieve_rag_context(
             results,
             ctx_size,
             max_tokens=token_budget,
+            stop_event=stop_event,
         )
 
         context = "\n\n---\n\n".join(sections)
         raw_length = len(context)
         try:
-            compressed = _compress_rag_context(query, context)
+            compressed = _compress_rag_context(query, context, stop_event=stop_event)
             if compressed:
                 context = compressed
                 log("RAG", f"Compressed context: {raw_length} -> {len(context)} chars")

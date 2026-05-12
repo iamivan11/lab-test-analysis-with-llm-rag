@@ -13,6 +13,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from config import DATA_DIR, MODELS_DIR
 from core.file_io import atomic_write_bytes, atomic_write_json, atomic_write_text
+from core.messages import (
+    SECURITY_FORMAT_UNSUPPORTED,
+    SECURITY_METADATA_CORRUPTED,
+    SECURITY_METADATA_INCOMPLETE,
+    SECURITY_METADATA_UNREADABLE,
+)
 
 SECURITY_FILE = DATA_DIR / "security.json"
 _SCHEMA_VERSION = 1
@@ -71,7 +77,7 @@ def _encrypt_bytes(data: bytes, key: bytes) -> dict[str, Any]:
 
 def _decrypt_payload(payload: dict[str, Any], key: bytes) -> bytes:
     if payload.get("cipher") != _CIPHER:
-        raise SecurityError("Unsupported encrypted file format.")
+        raise SecurityError(SECURITY_FORMAT_UNSUPPORTED)
     return AESGCM(key).decrypt(
         _unb64(str(payload["nonce"])),
         _unb64(str(payload["ciphertext"])),
@@ -101,9 +107,9 @@ def _data_key_from_password(password: str) -> bytes:
     try:
         data = json.loads(SECURITY_FILE.read_text(encoding="utf-8"))
     except OSError as e:
-        raise SecurityError(f"Cannot read security metadata: {e}") from e
+        raise SecurityError(SECURITY_METADATA_UNREADABLE.format(error=e)) from e
     except json.JSONDecodeError as e:
-        raise SecurityError("Security metadata is corrupted (not valid JSON).") from e
+        raise SecurityError(SECURITY_METADATA_CORRUPTED) from e
 
     try:
         password_key = _derive_key(
@@ -112,7 +118,7 @@ def _data_key_from_password(password: str) -> bytes:
             int(data["iterations"]),
         )
     except (KeyError, ValueError) as e:
-        raise SecurityError("Security metadata is missing required fields.") from e
+        raise SecurityError(SECURITY_METADATA_INCOMPLETE) from e
 
     try:
         verifier = _decrypt_payload(data["verifier"], password_key)
@@ -124,7 +130,7 @@ def _data_key_from_password(password: str) -> bytes:
     except InvalidTag as e:
         raise SecurityError("Invalid password.") from e
     except (KeyError, ValueError) as e:
-        raise SecurityError("Security metadata is missing required fields.") from e
+        raise SecurityError(SECURITY_METADATA_INCOMPLETE) from e
 
     if not hmac.compare_digest(verifier, _VERIFIER):
         raise SecurityError("Invalid password.")
@@ -146,10 +152,10 @@ def change_password(current_password: str, new_password: str) -> None:
 def disable_password(current_password: str) -> None:
     global _session_key
     _session_key = _data_key_from_password(current_password)
-    # Recursive sweep, not the curated list: any file added to the
-    # encryption flow but missed in `decrypt_known_sensitive_files` would
-    # otherwise be orphaned (encrypted on disk after the security file is
-    # gone, with no key to recover it).
+    # Recursive sweep so a sensitive path that was added to the
+    # encryption flow but missed by a curated list isn't left orphaned —
+    # encrypted on disk after the security file is gone, with no key to
+    # recover it.
     _decrypt_all_under_data_dir()
     SECURITY_FILE.unlink(missing_ok=True)
     _session_key = None
@@ -269,28 +275,3 @@ def migrate_known_sensitive_files() -> None:
         encrypt_file_in_place(path)
 
 
-def decrypt_known_sensitive_files() -> None:
-    from config import (
-        DOCS_DIR,
-        FILTERING_OUTPUT_DIR,
-        PARSING_OUTPUT_DIR,
-        PROFILE_FILE,
-        REPORTS_DIR,
-        SETTINGS_FILE,
-    )
-    from core.biomarkers import BIOMARKERS_FILE
-    from core.chat_store import CHATS_DIR
-
-    for path in [
-        PROFILE_FILE,
-        *(path for path in DOCS_DIR.glob("*") if path.is_file()),
-        BIOMARKERS_FILE,
-        *CHATS_DIR.glob("*.json"),
-        *PARSING_OUTPUT_DIR.glob("*.md"),
-        *FILTERING_OUTPUT_DIR.glob("*.md"),
-        *FILTERING_OUTPUT_DIR.glob("*.meta.json"),
-        *REPORTS_DIR.glob("health_report.*"),
-    ]:
-        if path == SETTINGS_FILE:
-            continue
-        decrypt_file_in_place(path)

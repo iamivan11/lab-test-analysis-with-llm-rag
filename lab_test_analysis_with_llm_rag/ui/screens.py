@@ -1,5 +1,5 @@
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -154,6 +154,12 @@ class HomeScreen(QWidget):
         # Settings content.
         self._settings_form = SettingsForm()
         self._settings_form.reindex_requested.connect(self.documents.reindex_files)
+        # Mirror reindex progress/status from the Documents tab back into
+        # the Settings form so the user sees feedback without switching
+        # tabs after clicking Reindex.
+        self.documents.reindex_status_changed.connect(
+            self._settings_form.update_reindex_status
+        )
         self._stack.addWidget(self._build_settings_content(self._settings_form))
 
         # ── Tiles ──
@@ -187,7 +193,16 @@ class HomeScreen(QWidget):
         tiles_scroll.setWidgetResizable(True)
         tiles_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         tiles_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        tiles_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        tiles_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Match sidebar bg via palette (not QSS): any QSS targeting this
+        # QScrollArea would force Qt onto QStyleSheetStyle and replace
+        # the native macOS scrollbar with a Fusion-style fallback.
+        sidebar_bg = QColor("#181825")
+        for w in (tiles_scroll.viewport(), tiles_wrap):
+            pal = w.palette()
+            pal.setColor(QPalette.ColorRole.Window, sidebar_bg)
+            w.setPalette(pal)
+            w.setAutoFillBackground(True)
         tiles_scroll.setWidget(tiles_wrap)
         sidebar_layout.addWidget(tiles_scroll, stretch=1)
 
@@ -219,7 +234,7 @@ class HomeScreen(QWidget):
     def _build_settings_content(self, form: SettingsForm) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 16, 40, 16)
         layout.setSpacing(16)
 
         form.setMinimumWidth(380)
@@ -251,7 +266,7 @@ class HomeScreen(QWidget):
     def _build_profile_content(self, form: ProfileForm) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 16, 40, 16)
         layout.setSpacing(16)
 
         form_wrap = QHBoxLayout()
@@ -280,6 +295,11 @@ class HomeScreen(QWidget):
             tile.setChecked(i == index)
         if index == self.PROFILE_INDEX:
             self._profile_form.reload()
+        elif index == self.DOCUMENTS_INDEX:
+            # Documents uploaded during onboarding (in a separate
+            # DocumentsHubWidget instance) wouldn't appear here unless
+            # we re-read DOCS_DIR from disk on activation.
+            self.documents._refresh_list()
         elif index == self.MODEL_HUB_INDEX:
             self.model_hub.refresh_local()
         elif index == self.HEALTH_REPORT_INDEX:

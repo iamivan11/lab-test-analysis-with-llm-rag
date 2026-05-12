@@ -1,4 +1,5 @@
 import contextlib
+import socket
 import subprocess
 import threading
 import time
@@ -8,17 +9,50 @@ from collections.abc import Callable
 import httpx
 
 from config import (
+    DEFAULT_SERVER_PORT,
     LLM_HEALTH_TIMEOUT_SECONDS,
     LLM_SERVER_READY_TIMEOUT_SECONDS,
     PROJECT_ROOT,
     SERVER_HOST,
-    SERVER_PORT,
     approved_model_file_path,
     approved_model_for_file,
 )
 from core.device_compat import current_device_capabilities, llama_gpu_layer_args
 from core.logger import log
+from core.messages import (
+    MODEL_ARCH_UNSUPPORTED,
+    MODEL_CONTEXT_TOO_LARGE,
+    MODEL_FILE_INVALID,
+    MODEL_LOAD_TIMEOUT,
+    MODEL_NOT_ENOUGH_MEMORY,
+    classify_by_substring,
+)
 
+
+def _find_free_port(start: int = DEFAULT_SERVER_PORT, attempts: int = 100) -> int:
+    """Return the first TCP port from `start` onward that we can bind to.
+
+    Probing with `bind` (no SO_REUSEADDR) gives a strict "is anyone else
+    on it" check. The probe socket is closed before we return, so the
+    caller (llama-server subprocess) can bind it microseconds later;
+    the race window is small enough to ignore in practice.
+    """
+    for offset in range(attempts):
+        port = start + offset
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((SERVER_HOST, port))
+            return port
+        except OSError:
+            continue
+    raise RuntimeError(
+        f"No free TCP port in range {start}..{start + attempts - 1}."
+    )
+
+
+# Picked once at module load — keeps SERVER_URL stable for default
+# arguments and importers that bind to the value at function-def time.
+SERVER_PORT = _find_free_port()
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 SERVER_BINARY = PROJECT_ROOT / "bin" / "llama-server"
 
@@ -36,18 +70,42 @@ _PROGRESS_MAP = [
 
 _STDERR_RING_SIZE = 500
 
+# Maps a substring that appears in llama.cpp/ggml stderr to a short
+# user-facing message. First match wins. The patterns are lower-cased
+# and matched case-insensitively against the captured stderr buffer
+# so we don't have to guess llama.cpp's exact log format per release.
+_STDERR_FAILURE_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
+    # Out-of-memory — Metal/CUDA buffer allocs and explicit OOMs.
+    (
+        (
+            "failed to allocate buffer",
+            "ggml_metal_graph_compute: command buffer",
+            "out of memory",
+            "memorystatus",
+            "killed",
+        ),
+        MODEL_NOT_ENOUGH_MEMORY,
+    ),
+    # Architecture not supported.
+    (("unknown model architecture",), MODEL_ARCH_UNSUPPORTED),
+    # All three "bad file" variants collapse to one user-facing message
+    # because the user's recovery is identical (re-download).
+    (
+        ("magic doesn't match", "gguf_init_from_file", "error loading model"),
+        MODEL_FILE_INVALID,
+    ),
+    # KV cache too large for available memory.
+    (("failed to create kv cache",), MODEL_CONTEXT_TOO_LARGE),
+)
 
-def _kill_port() -> None:
-    try:
-        result = subprocess.run(
-            ["lsof", "-ti", f":{SERVER_PORT}"],
-            capture_output=True,
-            text=True,
-        )
-        for pid in result.stdout.strip().splitlines():
-            subprocess.run(["kill", "-9", pid], capture_output=True)
-    except Exception:
-        pass
+
+def _classify_stderr(lines: list[str]) -> str | None:
+    """Return a concise user-facing message for known llama-server
+    failure modes, or None if nothing matched. Inspects the buffered
+    stderr captured during this start attempt."""
+    if not lines:
+        return None
+    return classify_by_substring("\n".join(lines), _STDERR_FAILURE_PATTERNS)
 
 
 def _parse_progress(line: str) -> str | None:
@@ -150,7 +208,6 @@ class LlamaServer:
             self._start_generation += 1
             generation = self._start_generation
             self._stop_locked(invalidate_start=False)
-            _kill_port()
 
             self._stderr_buffer.clear()
             self._progress_cb = on_progress
@@ -171,11 +228,20 @@ class LlamaServer:
 
         try:
             self._wait_for_ready(generation, proc)
-        except Exception:
+        except Exception as e:
+            classified: str | None = None
             with self._lock:
                 if generation == self._start_generation:
                     self._dump_stderr_buffer()
+                    # Skip classification for user-initiated cancellation —
+                    # the worker filters that out via token comparison
+                    # anyway, and we don't want "Not enough memory" on a
+                    # plain stop.
+                    if "cancelled" not in str(e).lower():
+                        classified = _classify_stderr(list(self._stderr_buffer))
                     self._stop_locked(invalidate_start=False)
+            if classified:
+                raise RuntimeError(classified) from e
             raise
         with self._lock:
             if (
@@ -199,11 +265,23 @@ class LlamaServer:
         if self._process and self._process.poll() is None:
             self._process.terminate()
             try:
-                self._process.wait(timeout=5)
+                self._process.wait(timeout=1)
+                log("SERVER", "process terminated cleanly")
             except subprocess.TimeoutExpired:
-                self._process.kill()
+                # Don't SIGKILL: when llama-server has a multi-GB model
+                # in unified memory + an active Metal context, an
+                # ungraceful kill has been observed to wedge the macOS
+                # Window Server (system-wide freeze, requires hard
+                # reboot). We accept a brief orphan instead — the OS
+                # will reap it once our parent process exits, and the
+                # next start_server() call picks a different free port
+                # via _find_free_port() so the orphan doesn't block it.
+                log("SERVER", "process did not exit in 1s; orphaning (OS will reap)")
         if self._stderr_thread:
-            self._stderr_thread.join(timeout=2)
+            # Daemon thread — gets reaped when the app exits even if it
+            # outlasts this join. Keep the wait tiny so app-close doesn't
+            # freeze on a slow stderr drain.
+            self._stderr_thread.join(timeout=0.1)
         self._process = None
         self._model_path = None
         self._stderr_thread = None
@@ -248,7 +326,7 @@ class LlamaServer:
             except (httpx.ConnectError, httpx.ReadError, httpx.ConnectTimeout):
                 pass
             time.sleep(0.2)
-        raise RuntimeError("llama-server did not become ready in time.")
+        raise RuntimeError(MODEL_LOAD_TIMEOUT)
 
     def _dump_stderr_buffer(self) -> None:
         if not self._stderr_buffer:

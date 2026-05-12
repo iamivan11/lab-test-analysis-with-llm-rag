@@ -1,9 +1,8 @@
 """UI workers for health-report generation."""
 
-import threading
 from datetime import datetime
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import Signal
 
 from core.health_report import (
     HEALTH_REPORT_MD,
@@ -17,11 +16,12 @@ from core.health_report import (
     write_report_pdf,
 )
 from core.llm_engine import generate_stream
-from core.logger import log
+from core.logger import log, log_exception
+from core.qthread_utils import StoppableQThread
 from core.security import write_protected_text
 
 
-class HealthReportWorker(QThread):
+class HealthReportWorker(StoppableQThread):
     """Streams report markdown, writes PDF, and reports progress to the UI."""
 
     progress = Signal(str)
@@ -48,12 +48,8 @@ class HealthReportWorker(QThread):
         self.document_names = document_names
         self.existing_markdown = existing_markdown
         self.max_tokens = max_tokens
-        self._stop_event = threading.Event()
         self._collected: list[str] = []
         self._thinking_observed = False
-
-    def stop(self) -> None:
-        self._stop_event.set()
 
     def run(self) -> None:
         log(
@@ -64,6 +60,7 @@ class HealthReportWorker(QThread):
             self.progress.emit("Reading documents...")
             doc_texts = gather_document_texts(self.document_names)
             if self._stop_event.is_set():
+                log("HEALTH", "HealthReportWorker: cancelled before stream")
                 self.cancelled.emit()
                 return
             if not doc_texts:
@@ -80,6 +77,7 @@ class HealthReportWorker(QThread):
                 history, ctx = build_full_report_history(self.profile_context, doc_texts)
 
             if self._stop_event.is_set():
+                log("HEALTH", "HealthReportWorker: cancelled before stream")
                 self.cancelled.emit()
                 return
 
@@ -104,6 +102,7 @@ class HealthReportWorker(QThread):
                 self.token.emit(tok)
 
             if self._stop_event.is_set():
+                log("HEALTH", "HealthReportWorker: cancelled after stream")
                 self.cancelled.emit()
                 return
 
@@ -141,7 +140,18 @@ class HealthReportWorker(QThread):
             )
             save_metadata(used_documents)
 
+            log(
+                "HEALTH",
+                f"HealthReportWorker: finished ({len(markdown)} chars markdown, "
+                f"{len(used_documents)} docs in metadata)",
+            )
             self.finished_ok.emit()
         except Exception as e:
-            log("HEALTH", f"HealthReportWorker: ERROR {e}")
+            # Promote cancel-induced exceptions to a cancellation, so the
+            # UI finalises the cancel instead of showing "error".
+            if self._stop_event.is_set():
+                log("HEALTH", f"HealthReportWorker: cancelled via exception ({e})")
+                self.cancelled.emit()
+                return
+            log_exception("HEALTH", "HealthReportWorker failed")
             self.error_occurred.emit(str(e))

@@ -36,6 +36,30 @@ def _approved_filenames(model_id: str) -> set[str]:
     return filenames
 
 
+def _hf_file_size(model_id: str, filename: str) -> int:
+    """Authoritative file size from the HuggingFace API.
+
+    Reads the LFS blob size directly from HF's file metadata, which is
+    accurate even when the CDN that serves the actual download returns a
+    wrong/missing Content-Length. Returns 0 if the API call fails — the
+    caller falls back to the response Content-Length in that case.
+    """
+    try:
+        from huggingface_hub import HfApi
+
+        infos = HfApi().get_paths_info(repo_id=model_id, paths=[filename])
+        if not infos:
+            return 0
+        info = infos[0]
+        lfs = getattr(info, "lfs", None)
+        if lfs is not None and getattr(lfs, "size", None):
+            return int(lfs.size)
+        return int(getattr(info, "size", 0) or 0)
+    except Exception as e:
+        log("HUB", f"HF API size lookup failed for {filename}: {e}")
+        return 0
+
+
 def download_model(
     model_id: str,
     filename: str,
@@ -72,9 +96,19 @@ def download_model(
     dest = dest_dir / filename
     tmp = dest.with_suffix(".gguf.part")
 
+    # Resolve the authoritative LFS size up-front. HF's CDN occasionally
+    # returns a wrong/missing Content-Length on the actual GET, which made
+    # the progress UI render garbage and could let a truncated file slip
+    # past the integrity check. The HF metadata API doesn't have that
+    # quirk — we trust it and only fall back to Content-Length if it fails.
+    expected_size = _hf_file_size(model_id, filename)
+    if expected_size:
+        log("HUB", f"HF reports {filename} = {expected_size} bytes")
+
     try:
         with urllib.request.urlopen(url, timeout=_HF_SOCKET_TIMEOUT) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
+            content_length = int(resp.headers.get("Content-Length", 0))
+            total = expected_size or content_length
             downloaded = 0
 
             with tmp.open("wb") as f:
@@ -100,15 +134,37 @@ def download_model(
         # `chunk = b""` and exits silently. Without this guard, a partial
         # file would get renamed to the final destination — and llama.cpp
         # later fails with "failed to seek for tensor X" when the truncated
-        # GGUF is loaded. Verify byte count matches Content-Length.
-        if total > 0 and downloaded < total:
+        # GGUF is loaded. Use the most authoritative size we have.
+        known_size = expected_size or content_length
+        if known_size > 0 and downloaded < known_size:
             raise OSError(
                 f"Download of {filename} truncated: got {downloaded} of "
-                f"{total} bytes. The connection likely dropped — please "
+                f"{known_size} bytes. The connection likely dropped — please "
                 f"retry the download."
             )
+        if known_size == 0:
+            # Both HF API and Content-Length unavailable — we can't verify
+            # the file is complete. Refuse to install rather than risk a
+            # silent corrupt-GGUF that crashes llama.cpp later.
+            raise OSError(
+                f"HuggingFace did not report a size for {filename}, so "
+                f"file integrity cannot be verified. This is usually "
+                f"transient — please retry in a moment."
+            )
 
-        tmp.rename(dest)
+        try:
+            tmp.rename(dest)
+        except OSError as e:
+            # Wrap the rename failure with the actual filenames in the
+            # message — Python's default OSError repr is helpful, but the
+            # `[Errno N] ... 'src' -> 'dst'` format gets truncated in the
+            # onboarding status label. Add context up front so the user
+            # sees "Failed to install <filename>" before the path noise.
+            log("HUB", f"Rename {tmp} -> {dest} failed: {e}")
+            raise OSError(
+                f"Failed to install {filename}: {e}. "
+                f"Check disk space and permissions, then retry."
+            ) from e
         return dest
 
     except BaseException:

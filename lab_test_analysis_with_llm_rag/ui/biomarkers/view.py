@@ -3,21 +3,9 @@ trends extracted from the user's medical documents."""
 
 from __future__ import annotations
 
-from datetime import datetime
-from math import ceil, floor, log10
 from typing import Any
 
-from PySide6.QtCharts import (
-    QAreaSeries,
-    QChart,
-    QChartView,
-    QDateTimeAxis,
-    QLineSeries,
-    QScatterSeries,
-    QValueAxis,
-)
-from PySide6.QtCore import QDateTime, QMargins, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -31,278 +19,32 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from config import (
+    add_hidden_biomarker,
+    clear_hidden_biomarkers,
+    load_hidden_biomarkers,
+)
 from core.biomarkers import (
     BIOMARKERS_FILE,
     BiomarkerExtractionWorker,
     aggregate_for_dashboard,
     clear_cache,
-    docs_pending_for_update,
     has_cache,
+    has_pending_refresh,
+    list_uploaded_docs,
 )
 from core.llm_engine import is_server_running
+from ui.biomarkers.charts import build_chart
+from ui.components import StatsBar, TimedStatusLabel, block_header, icon_button
 
 
-# Palette
-_COLOR_LINE = QColor("#89b4fa")
-_COLOR_LINE_LIGHT = QColor("#a4c2fb")
-_COLOR_OK = QColor("#a6e3a1")
-_COLOR_BAD = QColor("#f38ba8")
-_COLOR_BAND = QColor(166, 227, 161, 40)  # translucent green
-_COLOR_GRID = QColor("#45475a")
-_COLOR_TEXT = QColor("#cdd6f4")
 _ACTION_BUTTON_SIZE = (100, 38)
 
 
-def _iso_to_qdatetime(iso: str) -> QDateTime:
-    dt = datetime.strptime(iso, "%Y-%m-%d")
-    return QDateTime(dt)
-
-
-def _nice_number(value: float) -> float:
-    if value <= 0:
-        return 1.0
-    exponent = floor(log10(value))
-    fraction = value / (10 ** exponent)
-    if fraction < 1.5:
-        nice_fraction = 1
-    elif fraction < 3:
-        nice_fraction = 2
-    elif fraction < 7:
-        nice_fraction = 5
-    else:
-        nice_fraction = 10
-    return nice_fraction * (10 ** exponent)
-
-
-def _nice_axis_range(
-    values: list[float], *, target_intervals: int = 4
-) -> tuple[float, float, int, str]:
-    raw_min = min(values)
-    raw_max = max(values)
-    span = max(raw_max - raw_min, abs(raw_max) * 0.1, 1.0)
-    step = _nice_number(span / target_intervals)
-    nice_min = floor((raw_min - step * 0.5) / step) * step
-    nice_max = ceil((raw_max + step * 0.5) / step) * step
-    if raw_min >= 0 and nice_min < 0:
-        nice_min = 0
-    tick_count = int(round((nice_max - nice_min) / step)) + 1
-    decimals = max(0, -floor(log10(step))) if step < 1 else 0
-    return nice_min, nice_max, tick_count, f"%.{decimals}f"
-
-
-def _point_key(x: int, y: float) -> tuple[int, float]:
-    return x, round(y, 12)
-
-
-def _format_point_tooltip(name: str, unit: str, point: dict[str, Any], value: float) -> str:
-    value_text = f"{value:g}" + (f" {unit}" if unit else "")
-    lines = [name, f"Date: {point['date']}", f"Value: {value_text}"]
-    source = point.get("source_doc")
-    if source:
-        lines.append(f"Source: {source}")
-    return "\n".join(lines)
-
-
-def _padded_time_range(timestamps: list[int]) -> tuple[int, int]:
-    x_min = min(timestamps)
-    x_max = max(timestamps)
-    day_ms = 24 * 60 * 60 * 1000
-    if x_min == x_max:
-        return x_min - day_ms, x_max + day_ms
-    padding = max(day_ms, round((x_max - x_min) * 0.06))
-    return x_min - padding, x_max + padding
-
-
-def _show_point_value_label(
-    point: Any,
-    state: bool,
-    tooltips: dict[tuple[int, float], str],
-    view: QChartView,
-    series: QScatterSeries,
-) -> None:
-    label = view._point_value_label
-    if not state:
-        label.hide()
-        return
-    text = tooltips.get(_point_key(int(round(point.x())), point.y()))
-    if not text:
-        label.hide()
-        return
-
-    label.setText(text)
-    label.adjustSize()
-    dot_pos = view.mapFromScene(view.chart().mapToPosition(point, series))
-    x = dot_pos.x() + 12
-    y = dot_pos.y() - label.height() - 8
-    x = max(4, min(x, view.viewport().width() - label.width() - 4))
-    y = max(4, min(y, view.viewport().height() - label.height() - 4))
-    label.move(x, y)
-    label.show()
-
-
-def _build_chart(name: str, slot: dict[str, Any]) -> QChartView:
-    """One line+scatter+band chart for a single biomarker time series."""
-    points = slot["points"]
-    unit = slot.get("unit", "")
-    chart = QChart()
-    chart.setTitle(f"{name}" + (f"  ({unit})" if unit else ""))
-    chart.setBackgroundBrush(QBrush(QColor("#1e1e2e")))
-    chart.setTitleBrush(QBrush(_COLOR_TEXT))
-    chart.legend().setVisible(False)
-    chart.setMargins(QMargins(12, 12, 12, 12))
-
-    line = QLineSeries()
-    line.setColor(_COLOR_LINE)
-    pen = QPen(_COLOR_LINE)
-    pen.setWidth(2)
-    line.setPen(pen)
-
-    scatter_ok = QScatterSeries()
-    scatter_ok.setColor(_COLOR_OK)
-    scatter_ok.setMarkerSize(10.0)
-    scatter_ok.setBorderColor(QColor("#1e1e2e"))
-
-    scatter_bad = QScatterSeries()
-    scatter_bad.setColor(_COLOR_BAD)
-    scatter_bad.setMarkerSize(10.0)
-    scatter_bad.setBorderColor(QColor("#1e1e2e"))
-
-    scatter_unknown = QScatterSeries()
-    scatter_unknown.setColor(_COLOR_LINE_LIGHT)
-    scatter_unknown.setMarkerSize(10.0)
-    scatter_unknown.setBorderColor(QColor("#1e1e2e"))
-
-    series_refs: list[Any] = [line, scatter_ok, scatter_bad, scatter_unknown]
-    scatter_tooltips: dict[QScatterSeries, dict[tuple[int, float], str]] = {
-        scatter_ok: {},
-        scatter_bad: {},
-        scatter_unknown: {},
-    }
-    timestamps: list[int] = []
-    values: list[float] = []
-    for p in points:
-        ts = _iso_to_qdatetime(p["date"]).toMSecsSinceEpoch()
-        v = float(p["value"])
-        timestamps.append(ts)
-        values.append(v)
-        line.append(ts, v)
-        if p["in_range"] is True:
-            scatter_ok.append(ts, v)
-            scatter = scatter_ok
-        elif p["in_range"] is False:
-            scatter_bad.append(ts, v)
-            scatter = scatter_bad
-        else:
-            scatter_unknown.append(ts, v)
-            scatter = scatter_unknown
-        scatter_tooltips[scatter][_point_key(ts, v)] = _format_point_tooltip(
-            name, unit, p, v
-        )
-
-    # Reference range band: take the latest measurement's range as the
-    # representative band (most labs use similar bounds; if they diverge
-    # the per-point colors will still tell the story).
-    band_low = next(
-        (p["ref_low"] for p in reversed(points) if p["ref_low"] is not None), None
-    )
-    band_high = next(
-        (p["ref_high"] for p in reversed(points) if p["ref_high"] is not None), None
-    )
-
-    band_added = False
-    if band_low is not None and band_high is not None and points:
-        upper = QLineSeries()
-        lower = QLineSeries()
-        for p in points:
-            ts = _iso_to_qdatetime(p["date"]).toMSecsSinceEpoch()
-            upper.append(ts, band_high)
-            lower.append(ts, band_low)
-        area = QAreaSeries(upper, lower)
-        area.setColor(_COLOR_BAND)
-        area.setBorderColor(QColor(0, 0, 0, 0))
-        chart.addSeries(area)
-        series_refs.extend([upper, lower, area])
-        band_added = True
-
-    chart.addSeries(line)
-    chart.addSeries(scatter_ok)
-    chart.addSeries(scatter_bad)
-    chart.addSeries(scatter_unknown)
-
-    axis_x = QDateTimeAxis()
-    axis_x.setFormat("yyyy-MM")
-    axis_x.setTickCount(min(8, max(2, len(points))))
-    axis_x.setLabelsBrush(QBrush(_COLOR_TEXT))
-    axis_x.setGridLineColor(_COLOR_GRID)
-    axis_x.setLinePenColor(_COLOR_GRID)
-    x_min, x_max = _padded_time_range(timestamps)
-    axis_x.setRange(
-        QDateTime.fromMSecsSinceEpoch(x_min),
-        QDateTime.fromMSecsSinceEpoch(x_max),
-    )
-    chart.addAxis(axis_x, Qt.AlignmentFlag.AlignBottom)
-
-    axis_y = QValueAxis()
-    # Pad y-range so points and band aren't flush against the edges.
-    candidates = list(values)
-    if band_low is not None:
-        candidates.append(band_low)
-    if band_high is not None:
-        candidates.append(band_high)
-    y_min, y_max, tick_count, label_format = _nice_axis_range(candidates)
-    axis_y.setRange(y_min, y_max)
-    axis_y.setTickCount(tick_count)
-    axis_y.setLabelFormat(label_format)
-    axis_y.setTruncateLabels(False)
-    axis_y.setLabelsBrush(QBrush(_COLOR_TEXT))
-    axis_y.setGridLineColor(_COLOR_GRID)
-    axis_y.setLinePenColor(_COLOR_GRID)
-    chart.addAxis(axis_y, Qt.AlignmentFlag.AlignLeft)
-
-    for s in (line, scatter_ok, scatter_bad, scatter_unknown):
-        s.attachAxis(axis_x)
-        s.attachAxis(axis_y)
-    if band_added:
-        # Also attach the area series' axes to render correctly.
-        chart.series()[0].attachAxis(axis_x)
-        chart.series()[0].attachAxis(axis_y)
-
-    view = QChartView(chart)
-    view.setRenderHint(QPainter.RenderHint.Antialiasing)
-    view.setMinimumHeight(220)
-    view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-    view.setStyleSheet("background: #1e1e2e; border: 1px solid #313244; border-radius: 8px;")
-    view._series_refs = series_refs
-    view._point_tooltips = scatter_tooltips
-    value_label = QLabel(view.viewport())
-    value_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-    value_label.setStyleSheet(
-        "background-color: #313244; color: #cdd6f4; border: 1px solid #89b4fa; "
-        "border-radius: 6px; padding: 4px 6px; font-size: 11px;"
-    )
-    value_label.hide()
-    view._point_value_label = value_label
-    for scatter, tooltips in scatter_tooltips.items():
-        scatter.hovered.connect(
-            lambda point, state, scatter=scatter, tooltips=tooltips: _show_point_value_label(
-                point, state, tooltips, view, scatter
-            )
-        )
-    return view
-
-
-def _panel_header(title: str) -> QLabel:
-    lbl = QLabel(title)
-    lbl.setStyleSheet(
-        "font-size: 16px; font-weight: bold; color: #89b4fa;"
-        " margin: 8px 0 4px 0;"
-    )
-    return lbl
-
-
 class TrendsContent(QWidget):
-    """Trends dashboard. Generate extracts everything from scratch; Update
-    extracts only documents new since last extraction."""
+    """Trends dashboard. Generate extracts everything from scratch; Refresh
+    extracts only documents new since last extraction; Rebuild restores any
+    individually hidden charts without re-extracting."""
 
     PANEL_ORDER = [
         "Reproductive Hormones",
@@ -325,20 +67,33 @@ class TrendsContent(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Injected by the host (main_window) so Generate/Refresh can refuse
+        # when another LLM-using worker is already on llama-server.
+        from collections.abc import Callable
+
+        self.busy_check: Callable[[], bool] | None = None
         self._worker: BiomarkerExtractionWorker | None = None
         self._render_generation = 0
         self._render_queue: list[tuple[QGridLayout, int, int, str, dict[str, Any]]] = []
-        self._rendered_cache_signature: int | None = None
+        self._rendered_cache_signature: tuple | None = None
         self._pending_render_generation = 0
-        self._pending_cache_signature: int | None = None
+        self._pending_cache_signature: tuple | None = None
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
         self._render_timer.timeout.connect(self._continue_render_queue)
+        # Scroll position to restore once the (async, batched) re-render
+        # finishes — preserves the user's place after hide/Rebuild/Refresh.
+        self._restore_scroll_y: int | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
         self.setObjectName("trendsContent")
+
+        # Mirrors the chat top-bar chips (model, memory, CPU, context).
+        # MainWindow.register_stats_bar pushes updates here.
+        self.stats_bar = StatsBar()
+        layout.addWidget(self.stats_bar)
 
         # ── Action buttons row ──
         btn_row = QHBoxLayout()
@@ -346,28 +101,41 @@ class TrendsContent(QWidget):
 
         self._generate_btn = QPushButton("Generate")
         self._generate_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
+        self._generate_btn.setToolTip(
+            "Extract biomarkers from all documents from scratch"
+        )
         self._generate_btn.clicked.connect(self._on_generate)
         btn_row.addWidget(self._generate_btn)
 
-        self._update_btn = QPushButton("Update")
-        self._update_btn.setObjectName("attachButton")
-        self._update_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
-        self._update_btn.clicked.connect(self._on_update)
-        btn_row.addWidget(self._update_btn)
+        self._rebuild_btn = QPushButton("Rebuild")
+        self._rebuild_btn.setObjectName("attachButton")
+        self._rebuild_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
+        self._rebuild_btn.setToolTip("Restore all removed charts")
+        self._rebuild_btn.clicked.connect(self._on_rebuild)
+        btn_row.addWidget(self._rebuild_btn)
+
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setObjectName("attachButton")
+        self._refresh_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
+        self._refresh_btn.setToolTip(
+            "Extract biomarkers only from new documents"
+        )
+        self._refresh_btn.clicked.connect(self._on_refresh)
+        btn_row.addWidget(self._refresh_btn)
 
         btn_row.addStretch()
 
         self._delete_all_btn = QPushButton("Delete All")
         self._delete_all_btn.setObjectName("stopButton")
         self._delete_all_btn.setFixedSize(*_ACTION_BUTTON_SIZE)
+        self._delete_all_btn.setToolTip("Delete all extracted biomarkers")
         self._delete_all_btn.clicked.connect(self._on_delete_all)
         btn_row.addWidget(self._delete_all_btn)
 
         layout.addLayout(btn_row)
 
         # ── Status + progress ──
-        self._status = QLabel("")
-        self._status.setObjectName("statusLabel")
+        self._status = TimedStatusLabel("")
         layout.addWidget(self._status)
 
         self._progress_widget = QWidget()
@@ -380,11 +148,9 @@ class TrendsContent(QWidget):
         self._progress.setTextVisible(False)
         self._progress.setFixedHeight(8)
         prow.addWidget(self._progress, stretch=1)
-        self._cancel_btn = QPushButton("✕")
-        self._cancel_btn.setObjectName("iconSecondary")
-        self._cancel_btn.setFixedSize(28, 28)
-        self._cancel_btn.setToolTip("Cancel")
-        self._cancel_btn.clicked.connect(self._on_cancel)
+        self._cancel_btn = icon_button(
+            "✕", tooltip="Cancel", on_click=self._on_cancel
+        )
         prow.addWidget(self._cancel_btn)
         self._progress_widget.setVisible(False)
         layout.addWidget(self._progress_widget)
@@ -397,7 +163,11 @@ class TrendsContent(QWidget):
         self._charts_host = QWidget()
         self._charts_host.setObjectName("trendsChartsHost")
         self._charts_layout = QVBoxLayout(self._charts_host)
-        self._charts_layout.setContentsMargins(0, 0, 0, 0)
+        # 24 px right gutter so charts stay clear of the macOS scrollbar
+        # whether it's overlay (~7-9 px wide, brief) or classic-always-on
+        # (~16 px wide, when the user has "Always show scrollbars" set
+        # in System Settings → Appearance).
+        self._charts_layout.setContentsMargins(0, 0, 24, 0)
         self._charts_layout.setSpacing(8)
         self._scroll.setWidget(self._charts_host)
         layout.addWidget(self._scroll, stretch=1)
@@ -428,8 +198,24 @@ class TrendsContent(QWidget):
 
     # ── Buttons ───────────────────────────────────────────────────────────
 
+    def _refuse_if_llm_busy(self) -> bool:
+        """Refuse to start a new LLM call while another is in flight.
+
+        Without this, the new request just queues at llama-server
+        (single-slot) and the user sees "Generating trends..." stuck
+        for minutes while parsing or another extraction finishes —
+        looks broken even though it's slow.
+        """
+        if self.busy_check is not None and self.busy_check():
+            self._status.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return True
+        return False
+
     def _on_generate(self) -> None:
-        if self._is_busy():
+        if self._is_busy() or self._refuse_if_llm_busy():
             return
         if not is_server_running():
             self._status.setText(
@@ -443,8 +229,8 @@ class TrendsContent(QWidget):
         self._render_charts()  # clears the dashboard while we extract
         self._start_worker(BiomarkerExtractionWorker.MODE_GENERATE)
 
-    def _on_update(self) -> None:
-        if self._is_busy():
+    def _on_refresh(self) -> None:
+        if self._is_busy() or self._refuse_if_llm_busy():
             return
         if not is_server_running():
             self._status.setText(
@@ -452,10 +238,22 @@ class TrendsContent(QWidget):
                 "Load on the model you want to use, then try again."
             )
             return
-        if not docs_pending_for_update():
-            self._status.setText("No new documents since last extraction.")
+        if not has_pending_refresh():
+            self._status.setText("Trends already in sync with documents.")
             return
         self._start_worker(BiomarkerExtractionWorker.MODE_UPDATE)
+
+    def _on_rebuild(self) -> None:
+        if self._is_busy():
+            return
+        clear_hidden_biomarkers()
+        self.refresh()
+
+    def _on_remove_biomarker(self, name: str) -> None:
+        if self._is_busy():
+            return
+        add_hidden_biomarker(name)
+        self.refresh()
 
     def _on_delete_all(self) -> None:
         if self._is_busy() or not has_cache():
@@ -493,14 +291,24 @@ class TrendsContent(QWidget):
         self._progress.setMaximum(total)
         self._progress.setValue(done)
 
-    def _on_finished(self) -> None:
+    def _on_finished(self, added: int, removed: int) -> None:
         self._set_busy(False)
-        self._status.setText("Trends ready.")
+        parts = []
+        if added > 0:
+            parts.append(f"added {added}")
+        if removed > 0:
+            parts.append(f"removed {removed}")
+        if parts:
+            self._status.setText("Trends ready — " + ", ".join(parts) + " document(s).")
+        else:
+            self._status.setText("Trends ready.")
         self.refresh()
 
     def _on_error(self, msg: str) -> None:
+        from core.messages import EXTRACTION_FAILED
+
         self._set_busy(False)
-        self._status.setText(f"Error: {msg}")
+        self._status.setText(EXTRACTION_FAILED.format(msg=msg))
         self._update_button_states()
 
     def _on_cancelled(self) -> None:
@@ -519,9 +327,11 @@ class TrendsContent(QWidget):
 
     def _update_button_states(self) -> None:
         busy = self._is_busy()
-        self._generate_btn.setEnabled(not busy)
-        self._update_btn.setEnabled(not busy and has_cache() and bool(docs_pending_for_update()))
+        has_docs = bool(list_uploaded_docs())
+        self._generate_btn.setEnabled(not busy and has_docs)
+        self._refresh_btn.setEnabled(not busy and has_cache() and has_pending_refresh())
         self._delete_all_btn.setEnabled(not busy and has_cache())
+        self._rebuild_btn.setEnabled(not busy and bool(load_hidden_biomarkers()))
 
     # ── Rendering ─────────────────────────────────────────────────────────
 
@@ -533,6 +343,12 @@ class TrendsContent(QWidget):
             and self._charts_layout.count() > 0
         ):
             return
+
+        # Capture the user's current scroll position before we tear the
+        # dashboard down. _render_next_batch will restore it after the
+        # last batch lands so hide/Rebuild/Refresh feel in-place.
+        if self._charts_layout.count() > 0:
+            self._restore_scroll_y = self._scroll.verticalScrollBar().value()
 
         self._render_generation += 1
         generation = self._render_generation
@@ -549,10 +365,14 @@ class TrendsContent(QWidget):
                 w.deleteLater()
 
         grouped = aggregate_for_dashboard()
+        hidden = load_hidden_biomarkers()
+        if hidden:
+            grouped = {n: s for n, s in grouped.items() if n not in hidden}
         if not grouped:
             self._scroll.setVisible(False)
             self._empty.setVisible(True)
             self._rendered_cache_signature = cache_signature
+            self._restore_scroll_y = None
             return
         self._scroll.setVisible(True)
         self._empty.setVisible(False)
@@ -579,7 +399,7 @@ class TrendsContent(QWidget):
                 spacer.setStyleSheet("background: transparent;")
                 self._charts_layout.addWidget(spacer)
 
-            self._charts_layout.addWidget(_panel_header(panel))
+            self._charts_layout.addWidget(block_header(panel, margin="8px 0 4px 0"))
             grid_wrap = QWidget()
             grid_layout = QGridLayout(grid_wrap)
             grid_layout.setContentsMargins(0, 0, 0, 0)
@@ -594,13 +414,16 @@ class TrendsContent(QWidget):
         self._charts_layout.addStretch()
         self._render_next_batch(generation, cache_signature)
 
-    def _cache_signature(self) -> int | None:
+    def _cache_signature(self) -> tuple | None:
         try:
-            return BIOMARKERS_FILE.stat().st_mtime_ns
+            mtime = BIOMARKERS_FILE.stat().st_mtime_ns
         except OSError:
             return None
+        # Include hidden set so hide/Rebuild trigger a re-render even
+        # though the cache file itself hasn't changed.
+        return (mtime, frozenset(load_hidden_biomarkers()))
 
-    def _render_next_batch(self, generation: int, cache_signature: int | None) -> None:
+    def _render_next_batch(self, generation: int, cache_signature: tuple | None) -> None:
         if generation != self._render_generation:
             return
         self._pending_render_generation = generation
@@ -608,7 +431,11 @@ class TrendsContent(QWidget):
 
         for _ in range(min(self.RENDER_BATCH_SIZE, len(self._render_queue))):
             grid_layout, row, col, name, slot = self._render_queue.pop(0)
-            grid_layout.addWidget(_build_chart(name, slot), row, col)
+            grid_layout.addWidget(
+                build_chart(name, slot, on_remove=self._on_remove_biomarker),
+                row,
+                col,
+            )
 
         if self._render_queue:
             self._render_timer.start(self.RENDER_BATCH_DELAY_MS)
@@ -616,6 +443,14 @@ class TrendsContent(QWidget):
 
         self._pending_cache_signature = None
         self._rendered_cache_signature = cache_signature
+        if self._restore_scroll_y is not None:
+            target = self._restore_scroll_y
+            self._restore_scroll_y = None
+            # Defer one tick: scrollbar's range is updated after the
+            # layout pass, and setValue clamps to current range.
+            QTimer.singleShot(
+                0, lambda y=target: self._scroll.verticalScrollBar().setValue(y)
+            )
 
     def _continue_render_queue(self) -> None:
         if not self._render_queue:

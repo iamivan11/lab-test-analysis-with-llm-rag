@@ -24,11 +24,13 @@ from config import (
     approved_model_for_file,
     format_size,
     get_default_model,
+    load_default_model_id,
 )
 from core.llm_engine import get_current_model_path
 from core.logger import log
+from ui.components import icon_button
 from ui.models.file_helpers import is_main_model, model_display_name
-from ui.models.hub_workers import DownloadWorker
+from ui.models.workers import DownloadWorker
 
 
 class ModelHubWidget(QWidget):
@@ -41,6 +43,14 @@ class ModelHubWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Injected by main_window so deleting the currently-loaded model
+        # can refuse while LLM work is in flight — otherwise the file
+        # vanishes from disk while llama-server holds it via mmap, the
+        # auto-recovery load_model() gets refused by the same gate, and
+        # the app sits in a half-state until the next manual action.
+        from collections.abc import Callable
+
+        self.busy_check: Callable[[], bool] | None = None
         self._download_workers: dict[int, DownloadWorker] = {}
         self._download_rows: dict[int, QWidget] = {}
         self._download_targets: dict[int, str] = {}
@@ -89,13 +99,25 @@ class ModelHubWidget(QWidget):
         return wrap
 
     def refresh_local(self):
+        # Rebuild the Download tab too so its per-row "↓" buttons reflect
+        # the current on-disk state (a model installed via onboarding or
+        # downloaded just now should NOT show as still downloadable).
+        self._populate_approved_downloads()
+
         models = sorted(
             approved_main_model_paths(),
             key=lambda p: p.name.lower(),
         )
         loaded_path = get_current_model_path()
+        # Include the default model id in the signature so changing the
+        # default in Settings re-renders the table — otherwise the
+        # per-row delete buttons keep their previous enabled/disabled
+        # state (the old default stays uneditable, the new default
+        # stays deletable).
+        default_id = load_default_model_id()
         signature = (
             loaded_path,
+            default_id,
             tuple((str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in models),
         )
         if signature == self._local_signature:
@@ -133,20 +155,35 @@ class ModelHubWidget(QWidget):
                 load_btn.clicked.connect(lambda _, p=str(path): self.load_requested.emit(p))
             self._local_table.setCellWidget(row, 2, load_btn)
 
-            del_btn = QPushButton("−")  # noqa: RUF001 - UI glyph, not arithmetic.
-            del_btn.setObjectName("iconSecondary")
-            del_btn.setFixedSize(28, 28)
             if path == approved_model_file_path(get_default_model()):
+                del_btn = icon_button(
+                    "−",  # noqa: RUF001 - UI glyph, not arithmetic.
+                    tooltip="Default model — cannot be deleted",
+                )
                 del_btn.setEnabled(False)
-                del_btn.setToolTip("Default model — cannot be deleted")
             else:
-                del_btn.setToolTip("Delete")
-                del_btn.clicked.connect(lambda _, p=path: self._delete_local(p))
+                del_btn = icon_button(
+                    "−",  # noqa: RUF001 - UI glyph, not arithmetic.
+                    tooltip="Delete",
+                    on_click=lambda p=path: self._delete_local(p),
+                )
             self._local_table.setCellWidget(row, 3, del_btn)
 
     def _delete_local(self, path: Path):
         log("MODELS", f"Deleting model: {path.name}")
         was_loaded = get_current_model_path() == str(path)
+        # Deleting the loaded model triggers an auto-swap to the default
+        # via loaded_model_deleted → ensure_default_model → load_model,
+        # which is gated by is_llm_busy. So if any LLM worker is active,
+        # the swap would be refused mid-flow and the app would sit with
+        # the file unlinked but llama-server still mmap'd onto it.
+        # Refuse the delete up front in that case.
+        if was_loaded and self.busy_check is not None and self.busy_check():
+            self._status.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         model = approved_model_for_file(path)
         if model and path.parent.name == model["display_name"]:
             shutil.rmtree(path.parent, ignore_errors=True)
@@ -199,12 +236,13 @@ class ModelHubWidget(QWidget):
             file_count = len(self._download_files(model))
             self._download_table.setItem(row, 2, QTableWidgetItem(str(file_count)))
 
-            dl_btn = QPushButton("↓")
-            dl_btn.setObjectName("iconPrimary")
-            dl_btn.setFixedSize(28, 28)
-            dl_btn.setToolTip("Download")
+            dl_btn = icon_button(
+                "↓",
+                name="iconPrimary",
+                tooltip="Download",
+                on_click=lambda m=model: self._start_download(m),
+            )
             dl_btn.setEnabled(bool(self._missing_download_files(model)))
-            dl_btn.clicked.connect(lambda _, m=model: self._start_download(m))
             self._download_table.setCellWidget(row, 3, dl_btn)
 
     def _download_files(self, model: dict) -> list[tuple[str, str]]:
@@ -240,6 +278,11 @@ class ModelHubWidget(QWidget):
                 str(approved_model_file_path(model, local_name)),
             )
         self._status.setText(f"Started {len(files)} download(s)")
+        # `_active_download_targets` was just populated; rebuild the
+        # Download tab so the per-row "↓" button reflects the active
+        # state (otherwise it stays clickable and a second click
+        # would spawn duplicate workers).
+        self._populate_approved_downloads()
 
     def _start_file_download(self, model: dict, hf_name: str, local_name: str) -> None:
         self._download_token += 1
@@ -285,11 +328,9 @@ class ModelHubWidget(QWidget):
         size_label.setMinimumWidth(100)
         progress_row.addWidget(size_label)
 
-        cancel_btn = QPushButton("✕")
-        cancel_btn.setObjectName("iconSecondary")
-        cancel_btn.setFixedSize(28, 28)
-        cancel_btn.setToolTip("Cancel")
-        cancel_btn.clicked.connect(lambda: self._cancel_download(token))
+        cancel_btn = icon_button(
+            "✕", tooltip="Cancel", on_click=lambda: self._cancel_download(token)
+        )
         progress_row.addWidget(cancel_btn)
 
         row._progress_bar = bar  # type: ignore[attr-defined]
@@ -326,6 +367,11 @@ class ModelHubWidget(QWidget):
             return
         self._remove_download_row(token)
         self._status.setText(f"Download error: {error}")
+        # The Download tab's per-row "↓" buttons consult
+        # `_active_download_targets`; rebuild the table now that the
+        # target was released, otherwise the button stays disabled
+        # until the user navigates away and back.
+        self._populate_approved_downloads()
 
     def _cancel_download(self, token: int):
         worker = self._download_workers.get(token)

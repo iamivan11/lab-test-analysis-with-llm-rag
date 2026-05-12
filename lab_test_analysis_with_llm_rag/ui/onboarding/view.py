@@ -11,14 +11,14 @@ from PySide6.QtWidgets import (
 )
 
 from config import (
+    SYSTEM_MODEL,
     approved_model_file_path,
     format_size,
-    get_default_model,
     save_model_path,
 )
 from ui.components import header_label, profile_scroll_area
 from ui.documents.view import DocumentsHubWidget
-from ui.onboarding.workers import DefaultModelDownloadWorker
+from ui.onboarding.workers import EmbedderPrefetchWorker, SingleFileDownloadWorker
 from ui.profile.form import ProfileForm
 
 
@@ -64,7 +64,7 @@ class WelcomeScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 16, 40, 40)
         layout.setSpacing(32)
 
         layout.addStretch()
@@ -119,10 +119,11 @@ class ProfileSetupScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(40, 40, 40, 40)
+        outer.setContentsMargins(40, 16, 40, 40)
         outer.setSpacing(12)
 
         outer.addWidget(header_label("To get started, please fill in your profile data:"))
+        outer.addSpacing(12)
 
         form_container = QWidget()
         form_wrap = QHBoxLayout(form_container)
@@ -137,14 +138,38 @@ class ProfileSetupScreen(QWidget):
 
         outer.addWidget(profile_scroll_area(form_container), stretch=1)
 
-        outer.addLayout(_onboarding_nav_row(on_back=None, on_continue=self._on_continue))
+        self._validation_label = QLabel("")
+        self._validation_label.setStyleSheet("color: #f38ba8;")
+        self._validation_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._validation_label.setVisible(False)
+        outer.addWidget(self._validation_label)
+
+        nav_row = _onboarding_nav_row(on_back=None, on_continue=self._on_continue)
+        outer.addLayout(nav_row)
+        self._continue_btn = nav_row.continue_btn
 
     def _on_continue(self):
+        missing = self._form.missing_required_fields()
+        if missing:
+            self._validation_label.setText(
+                f"Please fill in: {', '.join(missing)}"
+            )
+            self._validation_label.setVisible(True)
+            return
+        self._validation_label.setVisible(False)
+        # Disable Continue immediately so a second click during the
+        # screen transition can't fire a second `continue_clicked` (which
+        # would race two ModelDownloadScreen.start() calls).
+        self._continue_btn.setEnabled(False)
         self._form.save()
         self.continue_clicked.emit()
 
     def reload(self):
         self._form.reload()
+        self._validation_label.setVisible(False)
+        # Re-enable Continue when the user comes back via the Back
+        # button so they can proceed forward again.
+        self._continue_btn.setEnabled(True)
 
 
 class ModelDownloadScreen(QWidget):
@@ -153,43 +178,40 @@ class ModelDownloadScreen(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._worker: DefaultModelDownloadWorker | None = None
+        # Three parallel workers — main GGUF, mmproj, embedder — each
+        # owns one progress row. Continue is gated on all three being
+        # done, but downloads run concurrently so the long mmproj +
+        # embedder don't sit idle while the model is still streaming.
+        self._model_worker: SingleFileDownloadWorker | None = None
+        self._mmproj_worker: SingleFileDownloadWorker | None = None
+        self._embedder_worker: EmbedderPrefetchWorker | None = None
+        self._model_done = False
+        self._mmproj_done = False
+        self._embedder_done = False
         self._model_path: str | None = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
-        layout.setSpacing(16)
+        layout.setContentsMargins(40, 16, 40, 40)
+        layout.setSpacing(12)
 
         layout.addStretch()
 
-        layout.addWidget(header_label("Loading the default AI model to your device..."))
+        self._header_label = header_label(
+            "Downloading essential system components to your device..."
+        )
+        layout.addWidget(self._header_label)
+        layout.addSpacing(12)
 
-        self._info_label = QLabel("")
-        self._info_label.setObjectName("statusLabel")
-        self._info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._info_label)
-
-        self._current_file_label = QLabel("Preparing download...")
-        self._current_file_label.setObjectName("statusLabel")
-        self._current_file_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._current_file_label)
-
-        bar_row = QHBoxLayout()
-        bar_row.addStretch()
-        self._progress = QProgressBar()
-        self._progress.setMinimum(0)
-        self._progress.setMaximum(1000)
-        self._progress.setValue(0)
-        self._progress.setTextVisible(False)
-        self._progress.setFixedWidth(640)
-        bar_row.addWidget(self._progress)
-        bar_row.addStretch()
-        layout.addLayout(bar_row)
-
-        self._size_label = QLabel("0 B / —")
-        self._size_label.setObjectName("statusLabel")
-        self._size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._size_label)
+        # Three rows: model, mmproj, embedder
+        self._model_title, self._model_progress, self._model_size = (
+            self._build_row(layout, "AI model")
+        )
+        self._mmproj_title, self._mmproj_progress, self._mmproj_size = (
+            self._build_row(layout, "Vision adapter")
+        )
+        self._embedder_title, self._embedder_progress, self._embedder_size = (
+            self._build_row(layout, "Search engine")
+        )
 
         layout.addStretch()
         nav_row = _onboarding_nav_row(
@@ -200,53 +222,172 @@ class ModelDownloadScreen(QWidget):
         self._continue_btn = nav_row.continue_btn
         layout.addLayout(nav_row)
 
+    def _build_row(
+        self, parent_layout: QVBoxLayout, title: str
+    ) -> tuple[QLabel, QProgressBar, QLabel]:
+        title_label = QLabel(title)
+        title_label.setObjectName("statusLabel")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        parent_layout.addWidget(title_label)
+        bar_row = QHBoxLayout()
+        bar_row.addStretch()
+        progress = QProgressBar()
+        progress.setMinimum(0)
+        progress.setMaximum(1000)
+        progress.setValue(0)
+        progress.setTextVisible(False)
+        progress.setFixedWidth(640)
+        bar_row.addWidget(progress)
+        bar_row.addStretch()
+        parent_layout.addLayout(bar_row)
+        size_label = QLabel("")
+        size_label.setObjectName("statusLabel")
+        size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        parent_layout.addWidget(size_label)
+        parent_layout.addSpacing(4)
+        return title_label, progress, size_label
+
     def start(self):
-        if self._worker and self._worker.isRunning():
-            return
-        model = get_default_model()
-        self._info_label.setText(model["display_name"])
-        model_path = approved_model_file_path(model)
-        mmproj_path = approved_model_file_path(model, model["mmproj_local"])
-        if model_path.exists() and mmproj_path.exists():
-            total = model_path.stat().st_size + mmproj_path.stat().st_size
-            self._progress.setValue(1000)
-            self._size_label.setText(f"{format_size(total)} / {format_size(total)}")
-            self._on_done(str(model_path))
-            return
+        # Onboarding bootstrap is always SYSTEM_MODEL (Qwen 3.5-9B). A
+        # user's chosen default in Settings is irrelevant here — we
+        # only install the known-good baseline; they can switch later.
+        model = SYSTEM_MODEL
+        download_dir = approved_model_file_path(model).parent
 
+        self._header_label.setText(
+            "Downloading essential system components to your device..."
+        )
         self._continue_btn.setEnabled(False)
-        self._current_file_label.setText("Starting...")
-        self._size_label.setText("0 B / —")
-        self._worker = DefaultModelDownloadWorker()
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_done)
-        self._worker.error_occurred.connect(self._on_error)
-        self._worker.start()
 
-    def _on_progress(self, downloaded: int, total: int, name: str):
-        self._current_file_label.setText(f"Downloading {name}")
+        # Spawn each phase if it hasn't already finished AND no worker
+        # is currently in flight. This makes Back→Continue a no-op for
+        # workers that are still alive (preserves their progress).
+        self._spawn_model_worker(model, download_dir)
+        self._spawn_mmproj_worker(model, download_dir)
+        self._spawn_embedder_worker()
+        # If all three already finished before the user clicked Back
+        # (and now came back via Continue), no new worker fires, so
+        # _check_all_done() won't run from the worker callbacks.
+        # Re-evaluate here so the header flips to "Success!" and
+        # the Continue button re-enables instead of getting stuck
+        # on the disabled state we just set above.
+        self._check_all_done()
+
+    def _spawn_model_worker(self, model, download_dir):
+        if self._model_done:
+            return
+        if self._model_worker is not None and self._model_worker.isRunning():
+            return
+        self._model_title.setText(f"AI model: {model['model_file']}")
+        self._model_size.setText("0 B / —")
+        self._model_worker = SingleFileDownloadWorker(
+            model["repo_id"],
+            model["model_file"],
+            model["model_file"],
+            download_dir,
+        )
+        self._model_worker.progress.connect(
+            lambda d, t: self._on_row_progress(self._model_progress, self._model_size, d, t)
+        )
+        self._model_worker.finished.connect(self._on_model_finished)
+        self._model_worker.error_occurred.connect(
+            lambda e: self._on_row_error(self._model_size, e, "AI model")
+        )
+        self._model_worker.start()
+
+    def _spawn_mmproj_worker(self, model, download_dir):
+        if self._mmproj_done:
+            return
+        if self._mmproj_worker is not None and self._mmproj_worker.isRunning():
+            return
+        self._mmproj_title.setText(f"Vision adapter: {model['mmproj_local']}")
+        self._mmproj_size.setText("0 B / —")
+        self._mmproj_worker = SingleFileDownloadWorker(
+            model["repo_id"],
+            model["mmproj_file"],
+            model["mmproj_local"],
+            download_dir,
+        )
+        self._mmproj_worker.progress.connect(
+            lambda d, t: self._on_row_progress(self._mmproj_progress, self._mmproj_size, d, t)
+        )
+        self._mmproj_worker.finished.connect(self._on_mmproj_finished)
+        self._mmproj_worker.error_occurred.connect(
+            lambda e: self._on_row_error(self._mmproj_size, e, "Vision adapter")
+        )
+        self._mmproj_worker.start()
+
+    def _spawn_embedder_worker(self):
+        if self._embedder_done:
+            return
+        if self._embedder_worker is not None and self._embedder_worker.isRunning():
+            return
+        self._embedder_title.setText("Search engine: jina-embeddings-v5-text-small")
+        self._embedder_size.setText("0 B / —")
+        self._embedder_progress.setRange(0, 1000)
+        self._embedder_progress.setValue(0)
+        self._embedder_worker = EmbedderPrefetchWorker()
+        # qint64 (downloaded, total) — aggregated across the embedder
+        # repo's individual files via a custom tqdm_class in the worker.
+        self._embedder_worker.progress.connect(
+            lambda d, t: self._on_row_progress(
+                self._embedder_progress, self._embedder_size, d, t
+            )
+        )
+        self._embedder_worker.finished.connect(self._on_embedder_finished)
+        self._embedder_worker.error_occurred.connect(
+            lambda e: self._on_row_error(self._embedder_size, e, "Search engine")
+        )
+        self._embedder_worker.start()
+
+    def _on_row_progress(
+        self, bar: QProgressBar, size_label: QLabel, downloaded: int, total: int
+    ):
         if total > 0:
-            self._progress.setValue(int(downloaded * 1000 / total))
-            self._size_label.setText(f"{format_size(downloaded)} / {format_size(total)}")
+            bar.setValue(int(downloaded * 1000 / total))
+            size_label.setText(f"{format_size(downloaded)} / {format_size(total)}")
         else:
-            self._progress.setValue(0)
-            self._size_label.setText(format_size(downloaded))
+            size_label.setText(format_size(downloaded))
 
-    def _on_done(self, model_path: str):
-        self._model_path = model_path
-        self._progress.setValue(1000)
-        self._current_file_label.setText("Download complete")
-        save_model_path(model_path)
-        self._continue_btn.setEnabled(True)
+    def _on_row_error(self, size_label: QLabel, error: str, label: str):
+        from core.logger import log
+        from core.messages import ONBOARDING_DOWNLOAD_FAILED
 
-    def _on_error(self, error: str):
-        self._current_file_label.setText(f"Error: {error}")
-        self._continue_btn.setEnabled(False)
+        log("UI", f"Onboarding {label} download failed: {error}")
+        size_label.setText(ONBOARDING_DOWNLOAD_FAILED.format(error=error))
+
+    def _on_model_finished(self, path: str):
+        self._model_path = path
+        self._model_done = True
+        save_model_path(path)
+        self._model_progress.setValue(1000)
+        self._check_all_done()
+
+    def _on_mmproj_finished(self, path: str):
+        self._mmproj_done = True
+        self._mmproj_progress.setValue(1000)
+        self._check_all_done()
+
+    def _on_embedder_finished(self):
+        self._embedder_done = True
+        self._embedder_progress.setRange(0, 1000)
+        self._embedder_progress.setValue(1000)
+        # Don't overwrite the size text — the worker already emitted
+        # progress(total, total) before finished, which set the label to
+        # "X / X" via _on_row_progress, matching the AI model / vision
+        # adapter rows. Writing "Ready" here would clobber that.
+        self._check_all_done()
+
+    def _check_all_done(self):
+        if self._model_done and self._mmproj_done and self._embedder_done:
+            self._header_label.setText("Success!")
+            self._continue_btn.setEnabled(True)
 
     def _on_continue(self):
         if not self._model_path:
             return
         self.proceed_clicked.emit(self._model_path)
+
 
 
 class DocumentsSetupScreen(QWidget):
@@ -256,15 +397,22 @@ class DocumentsSetupScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(40, 40, 40, 40)
+        layout.setContentsMargins(40, 16, 40, 40)
         layout.setSpacing(16)
 
         layout.addWidget(
             header_label("Upload your medical documents now, or skip and add them later")
         )
+        layout.addSpacing(12)
 
         self.docs = DocumentsHubWidget(self)
         layout.addWidget(self.docs, stretch=1)
+
+        self._busy_label = QLabel("")
+        self._busy_label.setStyleSheet("color: #f9e2af;")
+        self._busy_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._busy_label.setVisible(False)
+        layout.addWidget(self._busy_label)
 
         nav_row = _onboarding_nav_row(
             on_back=self.back_clicked.emit,
@@ -275,5 +423,13 @@ class DocumentsSetupScreen(QWidget):
 
     def _on_continue(self):
         if self.docs.is_busy():
+            # Surface why Continue didn't advance — without this, the
+            # button looks broken when the user clicks it during an
+            # in-flight parse.
+            self._busy_label.setText(
+                "Wait for indexing to finish before continuing."
+            )
+            self._busy_label.setVisible(True)
             return
+        self._busy_label.setVisible(False)
         self.proceed_clicked.emit()
