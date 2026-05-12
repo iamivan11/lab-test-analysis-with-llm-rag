@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 ROOT = Path(SPECPATH).parent
 SOURCE_ROOT = ROOT / "lab_test_analysis_with_llm_rag"
@@ -14,13 +16,40 @@ binaries = []
 if (ROOT / "bin").exists():
     binaries.extend((str(path), "bin") for path in (ROOT / "bin").iterdir() if path.is_file())
 
+# chromadb / huggingface_hub do dynamic imports (backend / telemetry /
+# segment impls; HF utils submodules) that PyInstaller's static analysis
+# doesn't see. Pulling every submodule into hiddenimports avoids
+# "No module named 'chromadb.api.rust'" / similar at runtime in the
+# bundled .app.
+#
+# Filter out chromadb's test/cli/server submodules: we never run them
+# at runtime, and bundling them pulls in optional deps (pytest, fastapi,
+# uvicorn, typer, kubernetes) that bloat the .app by tens of MB and emit
+# noisy "module not found" warnings during the PyInstaller build.
+def _keep_chromadb_submodule(name: str) -> bool:
+    excluded_prefixes = (
+        "chromadb.test",
+        "chromadb.cli",
+        "chromadb.server",
+    )
+    return not any(name.startswith(prefix) for prefix in excluded_prefixes)
+
+
+chromadb_submodules = [
+    name
+    for name in collect_submodules("chromadb")
+    if _keep_chromadb_submodule(name)
+]
+huggingface_hub_submodules = collect_submodules("huggingface_hub")
+
 a = Analysis(
     [str(SOURCE_ROOT / "main.py")],
     pathex=[str(SOURCE_ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=[
-        "chromadb",
+        *chromadb_submodules,
+        *huggingface_hub_submodules,
         "cryptography",
         "pypdfium2",
         "sentence_transformers",
@@ -63,7 +92,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="Lab Analyzer.app",
-    icon=None,
+    icon=str(ROOT / "assets" / "app_icon" / "logo.icns"),
     bundle_identifier="local.lab-analyzer",
     info_plist={
         "CFBundleDisplayName": "Lab Analyzer",

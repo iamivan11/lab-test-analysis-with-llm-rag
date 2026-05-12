@@ -1,93 +1,8 @@
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
-
 from config import approved_model_for_file, load_model_meta, load_model_path, save_model_path
-from core.llm_engine import start_server
-from core.llm_server import stop_server
 from core.logger import log
-from core.model_hub import ensure_default_model
-
-
-class ServerStartWorker(QThread):
-    progress = Signal(str)
-    meta_ready = Signal(object)
-    finished = Signal(str)
-    error_occurred = Signal(str)
-
-    def __init__(self, model_path: str, token: int):
-        super().__init__()
-        self.model_path = model_path
-        self.token = token
-
-    def stop(self):
-        # llama-server's start path uses an internal generation counter
-        # to detect cancellation: stop_server() bumps it and terminates
-        # any subprocess in flight, so the worker's _wait_for_ready loop
-        # raises "start was cancelled" on its next tick and run() exits.
-        stop_server()
-
-    def run(self):
-        log("WORKER", f"ServerStartWorker: starting with {self.model_path}")
-        try:
-            from config import load_ctx_size, save_model_meta
-            from core.model_meta import read_model_meta
-
-            meta = read_model_meta(self.model_path)
-            display_name = (
-                model["display_name"]
-                if (model := approved_model_for_file(self.model_path))
-                else meta.name
-            )
-            save_model_meta(
-                self.model_path,
-                {
-                    "name": display_name,
-                    "context_length": meta.context_length,
-                },
-            )
-            self.meta_ready.emit(meta)
-
-            # Per-model ctx setting: each model remembers its own value.
-            # First-time load of a model defaults to that model's own max
-            # context length (so the user gets full capability without
-            # guessing). They can lower it per-model in Settings if memory
-            # is tight.
-            n_ctx = load_ctx_size(self.model_path) or (meta.context_length or 8192)
-            start_server(self.model_path, n_ctx=n_ctx, on_progress=self.progress.emit)
-            log("WORKER", "ServerStartWorker: finished successfully")
-            self.finished.emit(display_name or Path(self.model_path).stem)
-        except Exception as e:
-            log("WORKER", f"ServerStartWorker: ERROR {e}")
-            self.error_occurred.emit(str(e))
-
-
-class ModelDownloadWorker(QThread):
-    progress = Signal(str)
-    finished = Signal(str)
-    error_occurred = Signal(str)
-
-    def __init__(self, token: int):
-        super().__init__()
-        self.token = token
-        self._stop_event = threading.Event()
-
-    def stop(self):
-        self._stop_event.set()
-
-    def run(self):
-        log("WORKER", "ModelDownloadWorker: ensuring default model")
-        try:
-            model_path = ensure_default_model(
-                on_progress=self.progress.emit,
-                stop_event=self._stop_event,
-            )
-            log("WORKER", f"ModelDownloadWorker: done, path={model_path}")
-            self.finished.emit(model_path)
-        except Exception as e:
-            log("WORKER", f"ModelDownloadWorker: ERROR {e}")
-            self.error_occurred.emit(str(e))
+from ui.models.workers import ModelDownloadWorker, ServerStartWorker
 
 
 class ModelController:
@@ -105,21 +20,31 @@ class ModelController:
         self.window._load_token += 1
         return self.window._load_token
 
+    def _is_current_worker(self, worker) -> bool:
+        """True if `worker` is the in-flight load (its token matches).
+
+        Used to drop stale callbacks from workers that completed after
+        the user (or our own code) advanced the load token — e.g. a
+        cancelled model swap whose `finished`/`error_occurred` arrives
+        on the main thread after a new load has started.
+        """
+        return worker is not None and worker.token == self.window._load_token
+
     def ensure_default_model(self):
-        self.window._status_label.setText("Preparing default model...")
+        self.window._set_general_status("Preparing default model...")
         self.window._model_btn.setEnabled(False)
         self.window._send_btn.setEnabled(False)
 
         token = self.new_load_token()
         self.window._download_worker = ModelDownloadWorker(token)
-        self.window._download_worker.progress.connect(self.window._status_label.setText)
+        self.window._download_worker.progress.connect(self.window._set_general_status)
         self.window._download_worker.finished.connect(self.on_default_model_ready)
         self.window._download_worker.error_occurred.connect(self.on_default_model_error)
         self.window._download_worker.start()
 
     def on_default_model_ready(self, model_path: str):
         worker = self.window._download_worker
-        if worker is None or worker.token != self.window._load_token:
+        if not self._is_current_worker(worker):
             log("UI", "Stale default-model ready event ignored")
             return
         save_model_path(model_path)
@@ -127,11 +52,11 @@ class ModelController:
 
     def on_default_model_error(self, error: str):
         worker = self.window._download_worker
-        if worker is None or worker.token != self.window._load_token:
+        if not self._is_current_worker(worker):
             log("UI", "Stale default-model error event ignored")
             return
         log("UI", f"Default model download error: {error}")
-        self.window._status_label.setText(
+        self.window._set_general_status(
             "Failed to download default model — click 'Load Model' to select manually"
         )
         self.window._model_btn.setEnabled(not self.window._parsing_active)
@@ -154,6 +79,30 @@ class ModelController:
             else:
                 log("UI", f"Model load ignored while another model is loading: {model_path}")
             return
+        # Defense at the source: any caller asking to load the model that's
+        # already running should be a no-op. Re-launching llama-server while
+        # a parse/chat HTTP request is in flight against it kills the
+        # in-flight call and races the new process onto the same port —
+        # which has crashed the app (e.g. Back→Continue on the onboarding
+        # download screen during a parse cancellation).
+        from core.llm_engine import get_current_model_path
+
+        if get_current_model_path() == model_path:
+            log("UI", f"Model already loaded — skipping reload: {model_path}")
+            return
+
+        # Refuse to swap models while a parse / chat / report / extraction
+        # is in flight: stopping llama-server out from under an active
+        # request lands its retry on the new (potentially non-vision)
+        # model, silently corrupting the result. Force the user to
+        # cancel or wait first.
+        if self.window.is_llm_busy():
+            log("UI", f"Refusing model swap to {model_path}: LLM-using worker is active")
+            self.window._set_general_status(
+                "Wait for the current operation to finish or cancel it, "
+                "then try loading the model again."
+            )
+            return
 
         if token is None:
             token = self.new_load_token()
@@ -162,12 +111,12 @@ class ModelController:
             display = model["display_name"]
         else:
             display = cached.get("name") or Path(model_path).stem
-        self.window._status_label.setText(f"Loading model: {display}...")
+        self.window._set_general_status(f"Loading model: {display}...")
         self.window._model_btn.setEnabled(False)
         self.window._send_btn.setEnabled(False)
 
         self.window._server_worker = ServerStartWorker(model_path, token)
-        self.window._server_worker.progress.connect(self.window._status_label.setText)
+        self.window._server_worker.progress.connect(self.window._set_general_status)
         self.window._server_worker.meta_ready.connect(self.on_model_meta)
         self.window._server_worker.finished.connect(self.on_server_started)
         self.window._server_worker.error_occurred.connect(self.on_server_error)
@@ -175,7 +124,7 @@ class ModelController:
 
     def on_model_meta(self, meta):
         worker = self.window._server_worker
-        if worker is None or worker.token != self.window._load_token:
+        if not self._is_current_worker(worker):
             return
         log("UI", f"Model meta: name={meta.name!r}, ctx={meta.context_length}")
         display = (
@@ -184,11 +133,11 @@ class ModelController:
             else meta.name
         )
         if display:
-            self.window._status_label.setText(f"Loading model: {display}...")
+            self.window._set_general_status(f"Loading model: {display}...")
 
     def on_server_started(self, model_name: str):
         worker = self.window._server_worker
-        if worker is None or worker.token != self.window._load_token:
+        if not self._is_current_worker(worker):
             log("UI", "Stale server-started event ignored")
             return
         log("UI", f"Server started, model: {model_name}")
@@ -206,9 +155,14 @@ class ModelController:
 
     def on_server_error(self, error: str):
         worker = self.window._server_worker
-        if worker is None or worker.token != self.window._load_token:
+        if not self._is_current_worker(worker):
             log("UI", "Stale server-error event ignored")
             return
         log("UI", f"Server error: {error}")
-        self.window._status_label.setText("Model load error: not supported")
+        # `error` is already the classified user-facing message from
+        # llm_server._classify_stderr (e.g. "Not enough memory..."),
+        # or the bare RuntimeError text from _wait_for_ready (timeout,
+        # unexpected exit) when no stderr pattern matched. Show it
+        # as-is — concise and specific to the actual failure.
+        self.window._set_general_status(error)
         self.window._model_btn.setEnabled(not self.window._parsing_active)

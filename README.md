@@ -48,25 +48,56 @@ profile data, logs, and generated reports are stored locally under macOS Applica
 ```text
 lab_test_analysis_with_llm_rag/
   main.py                  # app entrypoint
-  config.py                # central app config, paths, model registry, RAG settings
+  config/                  # central app config package
+    paths.py               # filesystem layout, dir creation, migrations
+    models.py              # APPROVED_MODELS catalog + helpers
+    settings.py            # AppSettings + persistence (Pydantic + RLock)
+    __init__.py            # re-exports + runtime tunables, format_size
   core/                    # non-UI logic
+    biomarkers/            # biomarker extraction package
+      store.py             # cache load/save, document helpers
+      units.py             # canonical-unit conversion table
+      aggregate.py         # per-biomarker time-series aggregation
+      extract.py           # BiomarkerExtractionWorker + LLM pipeline
+      __init__.py          # re-exports
     document_parser.py     # document parsing/filtering pipeline
     knowledge_base.py      # chunking, embeddings, ChromaDB indexing/retrieval
-    llm_server.py          # llama-server lifecycle
+    llm_engine.py          # streaming LLM client (chat, RAG, summarize)
+    llm_server.py          # llama-server lifecycle + port selection
     model_hub.py           # approved model downloads
     rag_context.py         # retrieved context preparation/compression
     health_report.py       # medical report generation
-    biomarkers.py          # biomarker extraction/trend data
-  ui/                      # PySide6 UI
+    messages.py            # centralised user-facing error/status strings
+    qthread_utils.py       # StoppableQThread base for workers
+    http_client.py         # cancellable POST + retry helper
+    security.py            # password-protected file encryption
+    file_io.py             # atomic JSON/text writes
+    logger.py              # rotating-file logger + crash hooks
+    user_data.py           # Clear User Data helper
+    macos_compat.py        # macOS version check + app-support dir
+    device_compat.py       # Metal/CPU capability detection
+    llama_setup.py         # bundled llama-server install
+    model_meta.py          # GGUF metadata reading
+    prompts.py             # system prompts (chat, RAG, health report)
+    chat_store.py          # chat persistence
+  ui/                      # PySide6 UI; each section follows the
+    components.py          # `view.py | form.py + controller.py + workers.py`
+    screens.py             # pattern as needed.
+    sections.py
+    styles.py
+    main_window.py
     chat/                  # document chat
     documents/             # upload, parse, reindex
     models/                # model download/selection
     profile/               # profile form
     settings/              # app settings
     health_report/         # report UI
-    biomarkers/            # biomarker trends UI
+    biomarkers/            # biomarker trends UI (view + charts)
     onboarding/            # first-run onboarding
-assets/icons/              # app UI icons
+    security/              # password unlock screen
+assets/
+  icons/                   # in-app UI icons
+  app_icon/                # macOS bundle icon (logo.png + logo.icns)
 bin/                       # local llama-server binary and dylibs
 packaging/                 # macOS packaging scripts/spec
 tests/                     # automated tests
@@ -135,26 +166,36 @@ Build `.app` and `.dmg`:
 packaging/build_macos.sh
 ```
 
-Outputs:
+Output:
 
 ```text
-dist/Lab Analyzer.app
 dist/Lab Analyzer.dmg
 ```
 
 The build script:
 
 - runs PyInstaller using `packaging/lab_analyzer.spec`;
-- includes UI icons from `assets/`;
+- includes UI icons from `assets/icons/` and the macOS bundle icon from `assets/app_icon/logo.icns`;
 - includes `bin/llama-server` and required dylibs;
 - verifies code signing;
-- creates a compressed DMG with an Applications shortcut.
+- creates a compressed DMG with an Applications shortcut;
+- removes the intermediate `.app` and staging directory so only the DMG remains in `dist/`.
 
 Current limitation: the DMG is not notarized, so macOS Gatekeeper may warn external users.
 
+### macOS refuses to open the app ("damaged" / "cannot be opened")
+
+Because the DMG isn't notarized, macOS quarantines the `.app` on download and Gatekeeper refuses to launch it. After dragging `Lab Analyzer.app` into `/Applications`, strip the quarantine attribute:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Lab Analyzer.app"
+```
+
+Then open the app normally.
+
 ## Model Notes
 
-Supported downloadable models are defined in `config.py` under `APPROVED_MODELS`.
+Supported downloadable models are defined in `config/models.py` under `APPROVED_MODELS`.
 The default system model is selected by `SYSTEM_MODEL_ID`.
 
 Large GGUF model files are stored in Application Support and are not committed to the repo.

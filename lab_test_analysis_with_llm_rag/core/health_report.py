@@ -18,7 +18,7 @@ from pathlib import Path
 from PySide6.QtCore import QMarginsF
 from PySide6.QtGui import QPageSize, QPdfWriter, QTextDocument
 
-from config import DOCS_DIR, PARSING_OUTPUT_DIR, REPORTS_DIR
+from config import PARSING_OUTPUT_DIR, REPORTS_DIR, list_uploaded_doc_paths
 from core.logger import log
 from core.security import (
     read_protected_json,
@@ -64,13 +64,20 @@ def delete_report() -> None:
         path.unlink(missing_ok=True)
 
 
+def remove_from_metadata(filename: str) -> None:
+    """Drop `filename` from the previous report's used_documents list."""
+    if not HEALTH_REPORT_META.exists():
+        return
+    meta = load_metadata()
+    used = meta.get("used_documents") or []
+    if filename not in used:
+        return
+    save_metadata([name for name in used if name != filename])
+
+
 def list_uploaded_documents() -> list[str]:
     """Filenames of all currently-uploaded source documents (DOCS_DIR)."""
-    if not DOCS_DIR.exists():
-        return []
-    return sorted(
-        f.name for f in DOCS_DIR.iterdir() if f.is_file() and not f.name.startswith(".")
-    )
+    return [p.name for p in list_uploaded_doc_paths()]
 
 
 def new_documents_since_last_report() -> list[str]:
@@ -299,5 +306,6 @@ __all__ = [
     "delete_report",
     "list_uploaded_documents",
     "new_documents_since_last_report",
+    "remove_from_metadata",
     "report_exists",
 ]

@@ -1,4 +1,5 @@
 import json
+import threading
 from collections.abc import Generator
 
 import httpx
@@ -84,11 +85,10 @@ def _input_token_budget(max_tokens: int | None) -> int:
 
 
 def _format_history_messages(messages: list[dict]) -> str:
-    lines = []
-    for msg in messages:
-        role = "User" if msg.get("role") == "user" else "Assistant"
-        lines.append(f"{role}: {msg.get('content', '')}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"{'User' if m.get('role') == 'user' else 'Assistant'}: {m.get('content', '')}"
+        for m in messages
+    )
 
 
 def _trim_to_token_budget(text: str, token_budget: int) -> str:
@@ -124,7 +124,9 @@ def _fit_recent_history(prior: list[dict], token_budget: int) -> str:
     return _trim_to_token_budget(f"{role}: {last.get('content', '')}", token_budget)
 
 
-def _build_history_context(prior: list[dict], token_budget: int) -> str:
+def _build_history_context(
+    prior: list[dict], token_budget: int, *, stop_event=None
+) -> str:
     if not prior or token_budget <= 0:
         return ""
 
@@ -136,7 +138,7 @@ def _build_history_context(prior: list[dict], token_budget: int) -> str:
     sections = []
     if older and remaining >= _MIN_OLDER_SUMMARY_TOKENS:
         try:
-            summary = summarize_history(older).strip()
+            summary = summarize_history(older, stop_event=stop_event).strip()
         except Exception as e:
             log("LLM", f"History summary failed, omitting older turns: {e}")
             summary = ""
@@ -151,7 +153,7 @@ def _build_history_context(prior: list[dict], token_budget: int) -> str:
     return "\n\n".join(sections)
 
 
-def summarize_history(history: list[dict]) -> str:
+def summarize_history(history: list[dict], stop_event=None) -> str:
     """Send a blocking request to compress conversation history into ~800 tokens."""
     log("LLM", f"summarize_history called, {len(history)} messages")
     conversation = "\n".join(f"{msg['role'].upper()}: {msg['content']}" for msg in history)
@@ -170,6 +172,7 @@ def summarize_history(history: list[dict]) -> str:
         f"{SERVER_URL}/v1/chat/completions",
         json={"model": "local", "messages": messages, "stream": False},
         timeout=120,
+        stop_event=stop_event,
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
@@ -181,9 +184,10 @@ def _build_system_content(
     *,
     use_rag: bool,
     system_content: str,
+    stop_event=None,
 ) -> str:
     if use_rag:
-        rag_context, has_docs = _retrieve_rag_context(history)
+        rag_context, has_docs = _retrieve_rag_context(history, stop_event=stop_event)
         if rag_context:
             system_content += (
                 "\n\n--- PATIENT'S HISTORICAL LAB DATA ---\n"
@@ -225,6 +229,7 @@ def _build_budgeted_chat_system_content(
     *,
     max_tokens: int | None,
     system_content: str,
+    stop_event=None,
 ) -> str:
     current_msg = history[-1]
     input_budget = _input_token_budget(max_tokens)
@@ -244,7 +249,9 @@ def _build_budgeted_chat_system_content(
     rag_context = ""
     has_docs = True
     if rag_budget > 0:
-        rag_context, has_docs = _retrieve_rag_context(history, token_budget=rag_budget)
+        rag_context, has_docs = _retrieve_rag_context(
+            history, token_budget=rag_budget, stop_event=stop_event
+        )
         rag_context = _trim_to_token_budget(rag_context, rag_budget)
     if rag_context:
         system_content += (
@@ -268,7 +275,9 @@ def _build_budgeted_chat_system_content(
         - _estimate_tokens(system_content)
         - _estimate_tokens(current_msg.get("content", "")),
     )
-    history_context = _build_history_context(history[:-1], history_budget)
+    history_context = _build_history_context(
+        history[:-1], history_budget, stop_event=stop_event
+    )
     if history_context:
         system_content += (
             "\n\n--- CONVERSATION SO FAR (budgeted; documents take priority) ---\n"
@@ -329,6 +338,7 @@ def generate_stream(
             context,
             max_tokens=max_tokens,
             system_content=system_content,
+            stop_event=stop_event,
         )
     else:
         system_content = _build_system_content(
@@ -336,6 +346,7 @@ def generate_stream(
             context,
             use_rag=use_rag,
             system_content=system_content,
+            stop_event=stop_event,
         )
 
     messages = [
@@ -360,56 +371,130 @@ def generate_stream(
         request_body["response_format"] = response_format
 
     log("LLM", "Opening streaming connection to server...")
-    with httpx.stream(
-        "POST",
-        f"{SERVER_URL}/v1/chat/completions",
-        json=request_body,
-        timeout=None,
-    ) as response:
-        if response.status_code >= 400:
-            # Read the body so the caller sees the real reason instead of a
-            # generic "400 Bad Request". llama-server emits a JSON body with
-            # "error: { message: ... }" — surface that text.
-            body = b"".join(response.iter_bytes()).decode("utf-8", errors="replace")
-            log("LLM", f"Server returned {response.status_code}: {body[:500]}")
-            try:
-                err = json.loads(body).get("error", {})
-                msg = err.get("message") or err.get("type") or body
-            except (json.JSONDecodeError, AttributeError):
-                msg = body or f"HTTP {response.status_code}"
-            # Heuristic: turn the common context-overflow message into
-            # something actionable for the user.
-            if any(k in msg.lower() for k in ("context", "n_ctx", "tokens", "exceeds")):
-                msg = (
-                    "The documents are too large for the current context "
-                    "window. Increase Context Window in Settings, or remove "
-                    "some documents.\n\n(server said: " + msg + ")"
-                )
-            # llama-server's HTTP body for 5xx is generic ("Compute error.").
-            # The actual cause (OOM, Metal kernel error, KV-cache failure,
-            # etc.) is in stderr. Append the last few stderr lines so the
-            # error surfaces something diagnostic.
-            if response.status_code >= 500:
-                tail = recent_server_stderr(n=15)
-                if tail:
-                    log("LLM", "Recent llama-server stderr (tail):")
-                    for line in tail:
-                        log("LLM_STDERR", line)
-                    msg = msg + "\n\n(server stderr tail:\n" + "\n".join(tail) + ")"
-            raise RuntimeError(msg)
-        log("LLM", f"Stream opened, status={response.status_code}")
-        for line in response.iter_lines():
-            if stop_event and stop_event.is_set():
-                return
-            if not line.startswith("data: "):
-                continue
-            data = line[len("data: ") :]
-            if data.strip() == "[DONE]":
-                return
-            chunk = json.loads(data)
-            if choices := chunk.get("choices"):
-                delta = choices[0].get("delta", {})
-                if token := delta.get("reasoning_content", ""):
-                    yield ("thinking", token)
-                if token := delta.get("content", ""):
-                    yield ("response", token)
+    # Bail before opening a connection if the user already cancelled —
+    # cheap save when stop fired during RAG/history-context retrieval.
+    if stop_event is not None and stop_event.is_set():
+        return
+    # Per-operation timeouts so a wedged llama-server (OOM, KV-cache
+    # failure, etc.) doesn't block the worker forever. read=600 lets an
+    # individual chunk wait up to 10 minutes — generous for big prompts
+    # where the first token can be slow, but bounded.
+    stream_timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+
+    # Hold the streaming client out where the consumer-side cancel can
+    # reach it. Closing the client from another thread makes the
+    # producer's iter_lines() raise a network error promptly — so
+    # llama-server sees its socket drop and stops generating tokens,
+    # instead of churning until the response finishes.
+    client_holder: dict = {}
+
+    import contextlib as _contextlib
+
+    def _stream_tokens():
+        """The actual httpx call — pulled out so we can run it in a
+        daemon producer thread when cancellation is needed."""
+        client = httpx.Client(timeout=stream_timeout)
+        client_holder["client"] = client
+        try:
+            with client.stream(
+                "POST",
+                f"{SERVER_URL}/v1/chat/completions",
+                json=request_body,
+            ) as response:
+                if response.status_code >= 400:
+                    # Read the body so the caller sees the real reason
+                    # instead of a generic "400 Bad Request". llama-server
+                    # emits a JSON body with "error: { message: ... }" —
+                    # surface that text.
+                    body = b"".join(response.iter_bytes()).decode("utf-8", errors="replace")
+                    log("LLM", f"Server returned {response.status_code}: {body[:500]}")
+                    try:
+                        err = json.loads(body).get("error", {})
+                        msg = err.get("message") or err.get("type") or body
+                    except (json.JSONDecodeError, AttributeError):
+                        msg = body or f"HTTP {response.status_code}"
+                    if any(k in msg.lower() for k in ("context", "n_ctx", "tokens", "exceeds")):
+                        msg = (
+                            "The documents are too large for the current context "
+                            "window. Increase Context Window in Settings, or remove "
+                            "some documents.\n\n(server said: " + msg + ")"
+                        )
+                    if response.status_code >= 500:
+                        tail = recent_server_stderr(n=15)
+                        if tail:
+                            log("LLM", "Recent llama-server stderr (tail):")
+                            for line in tail:
+                                log("LLM_STDERR", line)
+                            msg = msg + "\n\n(server stderr tail:\n" + "\n".join(tail) + ")"
+                    raise RuntimeError(msg)
+                log("LLM", f"Stream opened, status={response.status_code}")
+                for line in response.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[len("data: ") :]
+                    if data.strip() == "[DONE]":
+                        return
+                    chunk = json.loads(data)
+                    if choices := chunk.get("choices"):
+                        delta = choices[0].get("delta", {})
+                        if token := delta.get("reasoning_content", ""):
+                            yield ("thinking", token)
+                        if token := delta.get("content", ""):
+                            yield ("response", token)
+        finally:
+            client_holder.pop("client", None)
+            with _contextlib.suppress(Exception):
+                client.close()
+
+    if stop_event is None:
+        yield from _stream_tokens()
+        return
+
+    # Cancellation path: run the actual streaming in a daemon producer
+    # thread, push tokens through a Queue, and let the consumer (this
+    # generator) bail in ~50 ms regardless of what the producer's
+    # iter_lines is doing. httpx's `client.close()` doesn't reliably
+    # interrupt an in-flight `iter_lines()` on every transport
+    # version, so we don't depend on it — we just abandon the daemon
+    # thread and the OS reclaims its socket when llama-server's reply
+    # eventually drains or the process exits.
+    import queue as _queue
+
+    q: _queue.Queue = _queue.Queue()
+    _DONE = object()
+    _ERROR = object()
+
+    def _producer() -> None:
+        try:
+            for item in _stream_tokens():
+                if stop_event.is_set():
+                    return
+                q.put(item)
+            q.put(_DONE)
+        except BaseException as e:  # noqa: BLE001 - surface every failure
+            q.put((_ERROR, e))
+
+    threading.Thread(target=_producer, daemon=True, name="llm-stream-producer").start()
+
+    while True:
+        if stop_event.is_set():
+            # Forcibly close the producer's httpx client so iter_lines
+            # aborts on the producer side too. Without this the daemon
+            # keeps reading bytes from llama-server, which keeps
+            # generating tokens — wasted CPU after the user already
+            # gave up. Closing the client drops the socket, which the
+            # server sees on its next write and stops.
+            client = client_holder.get("client")
+            if client is not None:
+                with _contextlib.suppress(Exception):
+                    client.close()
+            return
+        try:
+            item = q.get(timeout=0.05)
+        except _queue.Empty:
+            continue
+        if item is _DONE:
+            return
+        if isinstance(item, tuple) and item and item[0] is _ERROR:
+            raise item[1]
+        yield item

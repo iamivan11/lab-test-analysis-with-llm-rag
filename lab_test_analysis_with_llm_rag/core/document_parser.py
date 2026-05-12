@@ -129,9 +129,15 @@ def _pdf_to_images(file_path: str) -> list[Image.Image]:
 
 
 def _extract_single_page(
-    page_index: int, img: Image.Image, server_url: str, total: int
+    page_index: int,
+    img: Image.Image,
+    server_url: str,
+    total: int,
+    stop_event=None,
 ) -> tuple[int, str]:
     """Extract text from a single page image. Returns (page_index, text)."""
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Page extraction cancelled")
     log("PARSER", f"Sending page {page_index + 1}/{total} to vision model...")
     data_uri = _image_to_base64(img)
     messages = [
@@ -153,6 +159,7 @@ def _extract_single_page(
             "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=PARSER_VISION_TIMEOUT_SECONDS,
+        stop_event=stop_event,
     )
     response.raise_for_status()
     message = response.json()["choices"][0]["message"]
@@ -170,29 +177,43 @@ def _extract_single_page(
     return (page_index, text.strip())
 
 
-def _extract_text_via_vision(images: list[Image.Image], server_url: str) -> str:
+def _extract_text_via_vision(
+    images: list[Image.Image], server_url: str, stop_event=None
+) -> str:
     """Send page images to the LLM server and collect extracted text."""
     total = len(images)
     if total == 1:
-        _, text = _extract_single_page(0, images[0], server_url, total)
+        _, text = _extract_single_page(0, images[0], server_url, total, stop_event)
         return text
 
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     log("PARSER", f"Processing {total} pages in parallel...")
+    results: list[str | None] = [None] * total
     with ThreadPoolExecutor(max_workers=min(total, PARSER_MAX_PARALLEL_PAGES)) as pool:
-        futures = [
-            pool.submit(_extract_single_page, i, img, server_url, total)
+        future_to_idx = {
+            pool.submit(_extract_single_page, i, img, server_url, total, stop_event): i
             for i, img in enumerate(images)
-        ]
-        results = [f.result() for f in futures]
+        }
+        for future in as_completed(future_to_idx):
+            if stop_event is not None and stop_event.is_set():
+                # Cancel any not-yet-started futures; in-flight ones will
+                # finish but their results get discarded by the caller's
+                # stop check after this returns.
+                for f in future_to_idx:
+                    f.cancel()
+                raise InterruptedError("Multi-page extraction cancelled")
+            idx = future_to_idx[future]
+            _, text = future.result()
+            results[idx] = text
 
-    results.sort(key=lambda r: r[0])
-    return "\n\n---\n\n".join(text for _, text in results)
+    return "\n\n---\n\n".join(text or "" for text in results)
 
 
-def _sanitize_text(text: str, server_url: str) -> str:
+def _sanitize_text(text: str, server_url: str, stop_event=None) -> str:
     """Remove administrative noise from parsed text while preserving clinical data."""
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Sanitization cancelled")
     log("PARSER", f"Sanitizing parsed text ({len(text)} chars)")
     response = post_with_retries(
         f"{server_url}/v1/chat/completions",
@@ -207,6 +228,7 @@ def _sanitize_text(text: str, server_url: str) -> str:
             "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=PARSER_SANITIZE_TIMEOUT_SECONDS,
+        stop_event=stop_event,
     )
     response.raise_for_status()
     message = response.json()["choices"][0]["message"]
@@ -226,8 +248,12 @@ def _normalize_report_date(value: str) -> str:
     return value if re.fullmatch(r"\d{2}/\d{2}/\d{4}", value) else ""
 
 
-def extract_document_metadata(text: str, server_url: str) -> dict[str, str]:
+def extract_document_metadata(
+    text: str, server_url: str, stop_event=None
+) -> dict[str, str]:
     """Extract report metadata from parsed text."""
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Metadata extraction cancelled")
     log("PARSER", f"Extracting document metadata ({len(text)} chars)")
     response = post_with_retries(
         f"{server_url}/v1/chat/completions",
@@ -242,6 +268,7 @@ def extract_document_metadata(text: str, server_url: str) -> dict[str, str]:
             "chat_template_kwargs": {"enable_thinking": False},
         },
         timeout=PARSER_METADATA_TIMEOUT_SECONDS,
+        stop_event=stop_event,
     )
     response.raise_for_status()
     message = response.json()["choices"][0]["message"]
@@ -262,7 +289,9 @@ def extract_document_metadata(text: str, server_url: str) -> dict[str, str]:
     return metadata
 
 
-def parse_document(file_path: str | Path, server_url: str) -> str:
+def parse_document(
+    file_path: str | Path, server_url: str, stop_event=None
+) -> str:
     """Parse a document and return extracted text via vision LLM."""
     file_path = str(file_path)
     ext = Path(file_path).suffix.lower()
@@ -285,26 +314,43 @@ def parse_document(file_path: str | Path, server_url: str) -> str:
     # Try up to 2 times — the server can get stuck after heavy requests
     last_error = None
     for attempt in range(2):
+        if stop_event is not None and stop_event.is_set():
+            raise InterruptedError("Document parsing cancelled")
         if attempt > 0:
             log("PARSER", f"Retry {attempt} for {name}, checking server health...")
+            recovered = False
             for _ in range(10):
+                if stop_event is not None and stop_event.is_set():
+                    raise InterruptedError("Document parsing cancelled")
                 if is_server_running():
+                    recovered = True
                     break
-                time.sleep(3)
-            else:
+                # Sleep in 0.5 s slices so cancel feels responsive even
+                # while waiting for the server to recover.
+                slept = 0.0
+                while slept < 3.0:
+                    if stop_event is not None and stop_event.is_set():
+                        raise InterruptedError("Document parsing cancelled")
+                    time.sleep(0.5)
+                    slept += 0.5
+            if not recovered:
                 raise RuntimeError(f"Server unresponsive after retry for {name}")
 
         try:
-            text = _extract_text_via_vision(images, server_url)
+            text = _extract_text_via_vision(images, server_url, stop_event)
             if text.strip():
                 break
             last_error = RuntimeError(f"Vision model returned empty text for {name}")
+        except InterruptedError:
+            raise
         except Exception as e:
             last_error = e
             log("PARSER", f"Attempt {attempt + 1} failed for {name}: {e}")
     else:
         raise last_error  # type: ignore[misc]
 
+    if stop_event is not None and stop_event.is_set():
+        raise InterruptedError("Document parsing cancelled")
     log("PARSER", f"Vision parsing succeeded: {len(text)} chars")
     raw_text = text
     if _RAW_SAVE_DIR:
@@ -313,7 +359,9 @@ def parse_document(file_path: str | Path, server_url: str) -> str:
         log("PARSER", f"Saved raw parsing result to {raw_save_path}")
 
     try:
-        text = _sanitize_text(text, server_url)
+        text = _sanitize_text(text, server_url, stop_event)
+    except InterruptedError:
+        raise
     except Exception as e:
         log("PARSER", f"Sanitization failed for {name}, using raw parsed text: {e}")
 

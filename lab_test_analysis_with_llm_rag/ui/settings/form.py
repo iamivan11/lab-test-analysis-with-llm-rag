@@ -24,6 +24,7 @@ from config import (
     save_default_model_id,
 )
 from core.llm_engine import get_current_model_path
+from ui.components import block_header
 from ui.sections import SectionNames
 from core.security import (
     SecurityError,
@@ -49,13 +50,6 @@ _FIELD_HEIGHT = 24
 def _section_label(text: str) -> QLabel:
     lbl = QLabel(text)
     lbl.setStyleSheet("font-weight: bold; font-size: 13px;")
-    return lbl
-
-
-def _block_header(text: str) -> QLabel:
-    lbl = QLabel(text)
-    lbl.setObjectName("settingsBlockHeader")
-    lbl.setStyleSheet("font-weight: bold; font-size: 16px; color: #89b4fa;")
     return lbl
 
 
@@ -102,11 +96,17 @@ class SettingsForm(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Injected by the host (main_window) so destructive actions can
+        # consult global worker state before running. None = no gate.
+        from collections.abc import Callable
+
+        self.busy_check: Callable[[], bool] | None = None
+
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        layout.addWidget(_block_header(SectionNames.MODELS))
+        layout.addWidget(block_header(SectionNames.MODELS))
 
         # The dropdown options depend on the currently-loaded model. We
         # build the empty combo here and populate it via reload(), which
@@ -129,15 +129,10 @@ class SettingsForm(QWidget):
 
         self._default_model_combo = QComboBox()
         self._default_model_combo.setFixedSize(_FIELD_WIDTH, _FIELD_HEIGHT)
-        for model_id in DEFAULT_MODEL_CHOICE_IDS:
-            self._default_model_combo.addItem(
-                APPROVED_MODELS[model_id]["display_name"], model_id
-            )
         # Track the value that was active when the form was opened so save()
         # can detect a real change and emit `default_model_changed`.
         self._initial_default_model_id = load_default_model_id()
-        idx = self._default_model_combo.findData(self._initial_default_model_id)
-        self._default_model_combo.setCurrentIndex(max(idx, 0))
+        self._populate_default_model_combo()
         _setting_block(
             layout,
             subheader="Default Model",
@@ -149,7 +144,7 @@ class SettingsForm(QWidget):
         )
 
         layout.addSpacing(8)
-        layout.addWidget(_block_header(SectionNames.CHAT_WITH_DOCUMENTS))
+        layout.addWidget(block_header(SectionNames.CHAT_WITH_DOCUMENTS))
 
         self._answer_detail_combo = QComboBox()
         self._answer_detail_combo.setFixedSize(_FIELD_WIDTH, _FIELD_HEIGHT)
@@ -168,22 +163,30 @@ class SettingsForm(QWidget):
         )
 
         layout.addSpacing(8)
-        layout.addWidget(_block_header(SectionNames.MEDICAL_DOCUMENTS))
+        layout.addWidget(block_header(SectionNames.MEDICAL_DOCUMENTS))
 
         self._reindex_btn = QPushButton("Reindex")
         self._reindex_btn.setObjectName("attachButton")
         self._reindex_btn.setFixedSize(_BUTTON_FIELD_WIDTH, _FIELD_HEIGHT)
         self._reindex_btn.setStyleSheet("padding: 0px; margin: 0px; font-size: 11px;")
         self._reindex_btn.clicked.connect(self.reindex_requested.emit)
-        _setting_block(
-            layout,
-            subheader="Index",
-            control=self._reindex_btn,
-            description="Rebuild document search from existing processed documents.",
+        layout.addWidget(_section_label("Index"))
+        layout.addWidget(self._reindex_btn)
+        layout.addWidget(
+            _description("Rebuild document search from existing processed documents.")
         )
+        # Live progress/feedback for the Reindex action. The Documents tab
+        # owns the worker; it forwards status here via update_reindex_status
+        # so the user doesn't need to switch tabs to know if anything is
+        # happening. Hidden by default — an always-visible empty label
+        # reserves layout space below the description, which the user
+        # reads as a styling bug.
+        self._reindex_status = _description("")
+        self._reindex_status.setVisible(False)
+        layout.addWidget(self._reindex_status)
 
         layout.addSpacing(8)
-        layout.addWidget(_block_header("Security"))
+        layout.addWidget(block_header("Security"))
 
         layout.addWidget(_section_label("Password Protection"))
         self._security_status = _description("")
@@ -260,6 +263,19 @@ class SettingsForm(QWidget):
         self._clear_data_message = _description("")
         layout.addWidget(self._clear_data_message)
 
+    def update_reindex_status(self, text: str, active: bool) -> None:
+        """Reflect the Documents tab's reindex state in the Settings form.
+
+        Called from HomeScreen wiring whenever DocumentsHubWidget emits
+        `reindex_status_changed`. Disables the Reindex button while a
+        reindex is genuinely active (active=True) so the user can't
+        spawn a duplicate; informational/error states leave it enabled
+        so they can retry.
+        """
+        self._reindex_status.setText(text)
+        self._reindex_status.setVisible(bool(text))
+        self._reindex_btn.setEnabled(not active)
+
     def reload(self) -> None:
         """Re-query the live model and rebuild model-dependent fields.
 
@@ -268,6 +284,38 @@ class SettingsForm(QWidget):
         dropdown is built once in __init__) is reflected immediately.
         """
         self._populate_ctx_combo()
+        self._populate_default_model_combo()
+
+    def _populate_default_model_combo(self) -> None:
+        """Rebuild the Default Model dropdown to list only installed models.
+
+        Showing models the user hasn't downloaded yet is misleading —
+        picking one as default would silently fail on the next launch
+        (model_path doesn't exist, so the home screen's saved-model load
+        falls back to download). Filter to what's actually on disk."""
+        from config import approved_model_file_path
+
+        previous = (
+            self._default_model_combo.currentData()
+            or self._initial_default_model_id
+        )
+        self._default_model_combo.blockSignals(True)
+        self._default_model_combo.clear()
+        for model_id in DEFAULT_MODEL_CHOICE_IDS:
+            model = APPROVED_MODELS[model_id]
+            if approved_model_file_path(model).exists():
+                self._default_model_combo.addItem(model["display_name"], model_id)
+        # If there are no installed default-choices (very early state —
+        # before onboarding finishes), fall back to listing all so the
+        # combo isn't empty and user has at least one selectable item.
+        if self._default_model_combo.count() == 0:
+            for model_id in DEFAULT_MODEL_CHOICE_IDS:
+                self._default_model_combo.addItem(
+                    APPROVED_MODELS[model_id]["display_name"], model_id
+                )
+        idx = self._default_model_combo.findData(previous)
+        self._default_model_combo.setCurrentIndex(max(idx, 0))
+        self._default_model_combo.blockSignals(False)
 
     def _populate_ctx_combo(self) -> None:
         """Rebuild the Context Window dropdown for the currently-loaded model.
@@ -377,6 +425,16 @@ class SettingsForm(QWidget):
         mode = self._security_mode
         if mode is None:
             return
+        # Enabling/disabling/changing password re-encrypts files that
+        # an in-flight worker may be reading (DOCS_DIR, profile, chats).
+        # Pulling the encryption out mid-read raises SecurityError in
+        # the worker. Refuse while any LLM-using worker is active.
+        if self.busy_check is not None and self.busy_check():
+            self._security_message.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         current = self._current_password.text()
         new = self._new_password.text()
         confirm = self._confirm_password.text()
@@ -427,12 +485,25 @@ class SettingsForm(QWidget):
         """Actually delete user data. Fires only after the user has opted
         in twice (Clear Everything → Yes, I am sure)."""
         self._clear_data_confirm_btn.setVisible(False)
+        # Refuse while any LLM-using worker is active: clear_user_data
+        # wipes DOCS_DIR / FILTERING_OUTPUT_DIR / chats / chromadb, all
+        # of which an in-flight IndexWorker, chat, or extraction is
+        # currently reading or writing. Doing the wipe mid-flight either
+        # crashes the worker or leaves the index in a half-cleared state.
+        if self.busy_check is not None and self.busy_check():
+            self._clear_data_message.setText(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         try:
             clear_user_data()
             self._clear_data_message.setText("User data cleared. Downloaded models were kept.")
             self.user_data_cleared.emit()
         except Exception as e:
-            self._clear_data_message.setText(f"Failed to clear user data: {e}")
+            from core.messages import CLEAR_USER_DATA_FAILED
+
+            self._clear_data_message.setText(CLEAR_USER_DATA_FAILED.format(error=e))
 
 
 __all__ = ["SettingsForm"]

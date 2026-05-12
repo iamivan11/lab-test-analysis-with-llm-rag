@@ -100,16 +100,6 @@ def enable_file_logging(
     _file_handler = handler
 
 
-def set_log_level(level: int | str) -> None:
-    """Update the log level for configured handlers."""
-    parsed_level = _parse_level(level)
-    _ensure_console_handler(parsed_level)
-    if _console_handler is not None:
-        _console_handler.setLevel(parsed_level)
-    if _file_handler is not None:
-        _file_handler.setLevel(parsed_level)
-
-
 def get_logger(tag: str) -> logging.LoggerAdapter:
     _ensure_console_handler()
     return _TagAdapter(_logger, {"tag": tag})
@@ -117,3 +107,53 @@ def get_logger(tag: str) -> logging.LoggerAdapter:
 
 def log(tag: str, msg: str, level: int | str = "INFO") -> None:
     get_logger(tag).log(_parse_level(level), msg)
+
+
+def log_exception(tag: str, msg: str) -> None:
+    """Log an in-flight exception with full traceback at ERROR level.
+
+    Use inside `except` blocks instead of `log(tag, f"... ERROR {e}")`:
+    bare `str(e)` lines hide the call site (we just saw a silent crash
+    where the log ended mid-task with no clue what raised). The traceback
+    is rendered by the stdlib `Logger.exception()` machinery.
+    """
+    get_logger(tag).exception(msg)
+
+
+def install_global_excepthooks() -> None:
+    """Route every escaped exception — main thread, QThread, native
+    signals (SIGSEGV/SIGBUS/SIGABRT) — into the same rotating log so
+    post-mortem analysis is possible without re-running under a debugger.
+    """
+    import faulthandler
+    import sys
+    import threading
+
+    # Native crashes (PyTorch/Metal/ggml/chromadb C extensions) bypass
+    # Python's exception machinery entirely; faulthandler dumps every
+    # thread's Python stack to stderr on a fatal signal. We also tee
+    # stderr into the file handler set up by enable_file_logging, so
+    # the dump survives the process death.
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+
+    def _main_thread_hook(exc_type, exc_value, exc_tb):
+        # KeyboardInterrupt is the user's intent; preserve default exit.
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        get_logger("CRASH").error(
+            "Unhandled exception on main thread",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    def _thread_hook(args: threading.ExceptHookArgs) -> None:
+        if issubclass(args.exc_type, SystemExit):
+            return
+        thread_name = args.thread.name if args.thread else "<unknown>"
+        get_logger("CRASH").error(
+            f"Unhandled exception on thread {thread_name!r}",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _main_thread_hook
+    threading.excepthook = _thread_hook

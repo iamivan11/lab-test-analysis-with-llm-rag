@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import load_profile, save_profile
+from ui.components import block_header
 
 
 def _bold_label(text: str) -> QLabel:
@@ -21,12 +22,6 @@ def _bold_label(text: str) -> QLabel:
     f = QFont()
     f.setBold(True)
     lbl.setFont(f)
-    return lbl
-
-
-def _section_label(text: str) -> QLabel:
-    lbl = QLabel(text)
-    lbl.setObjectName("profileSectionLabel")
     return lbl
 
 
@@ -56,12 +51,25 @@ class ProfileForm(QWidget):
         form.setSpacing(8)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        # Without this, Qt's default style policy on a wide form pushes
+        # rows whose field side is much wider than the label (Gender,
+        # Smoking, Alcohol — all toggle-button rows with Expanding size
+        # policy) onto two lines: label above, buttons below. Locking it
+        # to DontWrapRows keeps every label flush-left of its field.
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
 
         self._add_section("Basic")
 
         self._name = QLineEdit(profile.get("name", ""))
         self._name.setPlaceholderText("e.g. John")
-        self._name.setValidator(QRegularExpressionValidator(QRegularExpression(r"[A-Za-z\s\-']+")))
+        # Allow letters from any script (Cyrillic, etc.) plus combining
+        # marks, spaces, hyphens, apostrophes, periods (for initials).
+        # \p{L}/\p{M} need UseUnicodePropertiesOption to be honoured.
+        name_regex = QRegularExpression(
+            r"[\p{L}\p{M}\s\-'\.]+",
+            QRegularExpression.PatternOption.UseUnicodePropertiesOption,
+        )
+        self._name.setValidator(QRegularExpressionValidator(name_regex))
         form.addRow(_bold_label("Name"), self._name)
 
         self._age = QLineEdit(profile.get("age", ""))
@@ -142,6 +150,13 @@ class ProfileForm(QWidget):
         self._allergies.setMaximumHeight(TEXT_FIELD_HEIGHT)
         form.addRow(_bold_label("Allergies"), self._allergies)
 
+        self._medicine = QTextEdit()
+        self._medicine.setPlainText(profile.get("medicine", ""))
+        self._medicine.setPlaceholderText("Current medications and dosages")
+        self._medicine.setMinimumHeight(TEXT_FIELD_HEIGHT)
+        self._medicine.setMaximumHeight(TEXT_FIELD_HEIGHT)
+        form.addRow(_bold_label("Medicine"), self._medicine)
+
         self._other = QTextEdit()
         self._other.setPlainText(profile.get("other", ""))
         self._other.setPlaceholderText("Any other relevant details...")
@@ -154,12 +169,31 @@ class ProfileForm(QWidget):
 
         outer.addLayout(form)
 
+    def missing_required_fields(self) -> list[str]:
+        """Names of required fields that haven't been filled in.
+
+        Used by onboarding to gate the Continue button. Public so the
+        screen doesn't have to reach into private widget attributes —
+        it's stable across internal refactors of the form."""
+        missing: list[str] = []
+        if not self._name.text().strip():
+            missing.append("Name")
+        if not self._age.text().strip():
+            missing.append("Age")
+        if not (self._male_btn.isChecked() or self._female_btn.isChecked()):
+            missing.append("Gender")
+        return missing
+
     def _add_section(self, title: str) -> None:
-        self.form.addRow(_vertical_spacer(8))
+        # Leading spacer separates this section from the previous one,
+        # but the first section sits at the top of the form — skipping it
+        # there aligns "Basic" with the equivalent top header in Settings.
+        if self.form.rowCount() > 0:
+            self.form.addRow(_vertical_spacer(8))
         spacer = QWidget()
         spacer.setFixedHeight(0)
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.form.addRow(_section_label(title), spacer)
+        self.form.addRow(block_header(title), spacer)
         self.form.addRow(_vertical_spacer(4))
 
     def _build_yes_no_row(self, value: str):
@@ -201,6 +235,7 @@ class ProfileForm(QWidget):
         self._height.setText(profile.get("height", ""))
         self._surgeries.setPlainText(profile.get("surgeries", ""))
         self._allergies.setPlainText(profile.get("allergies", ""))
+        self._medicine.setPlainText(profile.get("medicine", ""))
         self._other.setPlainText(profile.get("other", ""))
         gender = profile.get("gender", "")
         self._male_btn.setChecked(gender == "Male")
@@ -241,9 +276,46 @@ class ProfileForm(QWidget):
             ),
             "surgeries": self._surgeries.toPlainText().strip(),
             "allergies": self._allergies.toPlainText().strip(),
+            "medicine": self._medicine.toPlainText().strip(),
             "other": self._other.toPlainText().strip(),
         }
         save_profile(profile)
 
 
-__all__ = ["ProfileForm"]
+class ProfileController:
+    """Provides the profile data the LLM needs as context.
+
+    Lives next to ProfileForm because both speak about the same profile
+    dict — keeping them in one file removes a one-function module that
+    was inconsistent with the rest of the codebase.
+    """
+
+    def __init__(self, window):
+        self.window = window
+
+    def build_profile_context(self) -> str:
+        profile = load_profile()
+        labels = {
+            "name": "Name",
+            "age": "Age",
+            "gender": "Gender",
+            "weight": "Weight",
+            "height": "Height",
+            "smoking": "Smoking",
+            "alcohol": "Alcohol",
+            "surgeries": "Surgeries",
+            "allergies": "Allergies",
+            "medicine": "Medicine",
+            "other": "Other",
+        }
+        lines = [
+            f"{label}: {profile[key]}"
+            for key, label in labels.items()
+            if profile.get(key)
+        ]
+        if not lines:
+            return ""
+        return "## Patient Profile\n\n" + "\n".join(lines)
+
+
+__all__ = ["ProfileController", "ProfileForm"]

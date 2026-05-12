@@ -14,57 +14,43 @@ from core.chat_store import (
 )
 from core.llm_engine import is_server_running
 from core.logger import log
+from core.messages import (
+    CHAT_COMPRESSION_FAILED,
+    CHAT_CONTEXT_TOO_LARGE,
+    CHAT_EMPTY_RESPONSE,
+    CHAT_INTERRUPTED_ON_CLOSE,
+    CHAT_LOCAL_MODEL_CONNECTION,
+    CHAT_LOCAL_MODEL_MEMORY,
+    CHAT_LOCAL_MODEL_STOPPED,
+    CHAT_TOKEN_LIMIT_NO_RESPONSE,
+    classify_by_substring,
+)
 from ui.chat.view import ChatItemWidget, RenameChatDialog, render_message_html
 from ui.chat.workers import CompressionWorker, LLMWorker
 
-TOKEN_LIMIT_NO_RESPONSE_MESSAGE = (
-    "Model used all available tokens on reasoning and produced no response. "
-    "Try increasing Answer Detail in Settings or simplifying your question."
-)
-GENERATION_INTERRUPTED_ON_CLOSE_MESSAGE = (
-    "Generation was interrupted because the app was closing. "
-    "Send the message again after reopening."
-)
-CONTEXT_TOO_LARGE_MESSAGE = (
-    "This request does not fit in the current context window. "
-    "Increase Context Window in Settings or reduce the attached/history content."
-)
-LOCAL_MODEL_STOPPED_MESSAGE = (
-    "The local model stopped during generation. Reload the model and try again."
-)
-LOCAL_MODEL_CONNECTION_MESSAGE = (
-    "Connection to the local model was interrupted during generation. "
-    "Try again; if it repeats, reload the model."
-)
-LOCAL_MODEL_MEMORY_MESSAGE = (
-    "The local model ran out of memory or failed during generation. "
-    "Lower Context Window or Answer Detail, or load a smaller model."
+
+_GENERATION_ERROR_PATTERNS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("out of memory", "oom", "memory", "metal", "kv-cache", "compute error"),
+        CHAT_LOCAL_MODEL_MEMORY,
+    ),
+    (
+        ("llm server is not running", "server is not running", "not running"),
+        CHAT_LOCAL_MODEL_STOPPED,
+    ),
+    (
+        ("connecterror", "readerror", "remoteprotocolerror", "connection", "disconnected"),
+        CHAT_LOCAL_MODEL_CONNECTION,
+    ),
+    (
+        ("context", "token", "length", "exceed", "too long", "413", "400"),
+        CHAT_CONTEXT_TOO_LARGE,
+    ),
 )
 
 
 def _friendly_generation_error(error: str) -> str:
-    error_lower = error.lower()
-    if any(
-        kw in error_lower
-        for kw in ("out of memory", "oom", "memory", "metal", "kv-cache", "compute error")
-    ):
-        return LOCAL_MODEL_MEMORY_MESSAGE
-    if any(
-        kw in error_lower
-        for kw in ("llm server is not running", "server is not running", "not running")
-    ):
-        return LOCAL_MODEL_STOPPED_MESSAGE
-    if any(
-        kw in error_lower
-        for kw in ("connecterror", "readerror", "remoteprotocolerror", "connection", "disconnected")
-    ):
-        return LOCAL_MODEL_CONNECTION_MESSAGE
-    if any(
-        kw in error_lower
-        for kw in ("context", "token", "length", "exceed", "too long", "413", "400")
-    ):
-        return CONTEXT_TOO_LARGE_MESSAGE
-    return error
+    return classify_by_substring(error, _GENERATION_ERROR_PATTERNS) or error
 
 
 class ChatController:
@@ -73,6 +59,11 @@ class ChatController:
 
     def new_chat(self):
         log("UI", "Creating new chat")
+        # Stop any in-flight generation and bump the generation token
+        # so stale token-emit signals from the old chat are filtered
+        # out by _is_current_generation — otherwise the previous chat's
+        # response would stream into the new empty display.
+        self._abort_active_generation()
         self.save_current_chat()
         self.window._current_chat = new_chat()
         self.window._history = []
@@ -80,6 +71,24 @@ class ChatController:
         self.window._chat_display.clear()
         self.refresh_chat_list()
         self.window._update_ctx_chip()
+
+    def _abort_active_generation(self) -> None:
+        """Cancel any in-flight LLMWorker and invalidate its callbacks.
+
+        Used when switching chats: without this, the worker keeps
+        streaming tokens after the user moved to a different chat, and
+        those tokens get appended to the new chat's display because the
+        chat display is shared.
+        """
+        worker = getattr(self.window, "_worker", None)
+        if worker is not None and worker.isRunning():
+            log("UI", "Aborting in-flight chat generation on chat switch")
+            worker.stop()
+        # Bump the token so any signals still in flight are dropped by
+        # _is_current_generation when they reach the main thread.
+        self.window._generation_token += 1
+        self.window._stop_btn.setEnabled(False)
+        self.window._send_btn.setEnabled(True)
 
     def save_current_chat(self):
         if self.window._history:
@@ -118,6 +127,11 @@ class ChatController:
                 self.refresh_chat_list()
 
     def delete_chat_by_id(self, chat_id: str):
+        # If the user deletes the chat that's currently generating,
+        # abort the worker first — otherwise its tokens stream into
+        # the fresh empty chat we replace it with.
+        if chat_id == self.window._current_chat["id"]:
+            self._abort_active_generation()
         delete_chat(chat_id)
         if chat_id == self.window._current_chat["id"]:
             self.window._current_chat = new_chat()
@@ -133,6 +147,9 @@ class ChatController:
         if chat_id == self.window._current_chat["id"]:
             return
         log("UI", f"Switching to chat {chat_id}")
+        # Same hazard as new_chat — stop any in-flight generation so its
+        # tokens don't bleed into the chat we're switching to.
+        self._abort_active_generation()
         self.save_current_chat()
         chat = load_chat(chat_id)
         if chat:
@@ -224,6 +241,20 @@ class ChatController:
         prompt = self.window._input_field.toPlainText().strip()
         if not prompt or not is_server_running():
             return
+        if self.window.is_llm_busy():
+            # llama-server runs --parallel 1; another worker (parse,
+            # trends, health report) is already holding the slot, so a
+            # new chat request would queue for minutes and look frozen.
+            # Surface the same "wait or cancel" banner used by every
+            # other section that hits this condition. Refuse before
+            # consuming the prompt so the user's input stays where it
+            # is and the chat history isn't polluted with an
+            # unanswered turn.
+            self.window._set_general_status(
+                "Wait for the current operation to finish or cancel it, "
+                "then try again."
+            )
+            return
         log("UI", f"_send_message: '{prompt[:80]}...'")
         self.window._input_field.clear()
         self.reset_format()
@@ -234,38 +265,15 @@ class ChatController:
         self.window._history.append({"role": "user", "content": prompt})
         if len(self.window._history) == 1:
             self.window._current_chat["title"] = title_from_first_message(prompt)
+            # Persist before refresh: refresh_chat_list() reads titles from
+            # disk via list_chats(), so without this save the sidebar would
+            # keep showing "New Chat" until the assistant's reply finished
+            # and triggered the next save.
+            self.save_current_chat()
             self.refresh_chat_list()
-        if self.window._parsing_active:
-            self.reply_chat_disabled()
-            return
         self.window._send_btn.setEnabled(False)
         self.window._compression_attempted = False
         self.launch_llm_worker(self.window._build_profile_context())
-
-    def reply_chat_disabled(self):
-        msg = (
-            "Chat is disabled while documents are being parsed. "
-            "Please wait for parsing to finish before sending new messages."
-        )
-        self.reset_format()
-        self.window._chat_display.append("<p>&nbsp;</p>")
-        label = (
-            f"Assistant ({self.window._model_name})"
-            if self.window._model_name
-            else "Assistant"
-        )
-        self.window._chat_display.append(f"<b style='color: #a6e3a1;'>{label}</b>")
-        self.window._chat_display.append(f"<i style='color: #f38ba8;'>{msg}</i>")
-        self.window._history.append(
-            {
-                "role": "assistant",
-                "content": msg,
-                "model": self.window._model_name,
-                "error": True,
-            }
-        )
-        self.save_current_chat()
-        self.refresh_chat_list()
 
     def launch_llm_worker(self, context: str = ""):
         log(
@@ -313,8 +321,16 @@ class ChatController:
         log("UI", "Generation stopped by user")
         self.window._generation_stopped = True
         self.window._stop_btn.setEnabled(False)
-        if self.window._worker:
-            self.window._worker.stop()
+        # LLMWorker handles the user's question. CompressionWorker may
+        # have replaced it as the in-flight worker after a context
+        # overflow (we re-prompt with summarised history); stopping
+        # ONLY _worker would leave compression running for minutes.
+        for worker in (
+            getattr(self.window, "_worker", None),
+            getattr(self.window, "_compression_worker", None),
+        ):
+            if worker is not None and worker.isRunning():
+                worker.stop()
 
     def update_link_hover(self, pos):
         if self.window._hovered_link_range is not None:
@@ -554,18 +570,27 @@ class ChatController:
             self.window._history.append(msg)
             self.save_current_chat()
             self.refresh_chat_list()
-        elif self.window._thinking_text:
-            error_text = TOKEN_LIMIT_NO_RESPONSE_MESSAGE
-            self.window._chat_display.append(f"<i style='color: #f38ba8;'>{error_text}</i>")
-            self.window._history.append(
-                {
-                    "role": "assistant",
-                    "content": error_text,
-                    "thinking": self.window._thinking_text,
-                    "model": self.window._model_name,
-                    "error": True,
-                }
+        else:
+            # Two empty-response paths: model spent its whole budget on
+            # reasoning (Qwen 3 quirk — `thinking_text` populated but
+            # `content` empty) vs returned literally nothing. Both leave
+            # the user staring at a blank reply unless we surface a
+            # message; previously only the thinking-only case was handled.
+            error_text = (
+                CHAT_TOKEN_LIMIT_NO_RESPONSE
+                if self.window._thinking_text
+                else CHAT_EMPTY_RESPONSE
             )
+            self.window._chat_display.append(f"<i style='color: #f38ba8;'>{error_text}</i>")
+            history_entry = {
+                "role": "assistant",
+                "content": error_text,
+                "model": self.window._model_name,
+                "error": True,
+            }
+            if self.window._thinking_text:
+                history_entry["thinking"] = self.window._thinking_text
+            self.window._history.append(history_entry)
             self.save_current_chat()
             self.refresh_chat_list()
         self.window._send_btn.setEnabled(True)
@@ -586,7 +611,7 @@ class ChatController:
             if self.window._history and self.window._history[-1]["role"] == "user":
                 self.window._history.pop()
         else:
-            error_text = GENERATION_INTERRUPTED_ON_CLOSE_MESSAGE
+            error_text = CHAT_INTERRUPTED_ON_CLOSE
             self.window._chat_display.append(f"<i style='color: #f38ba8;'>{error_text}</i>")
             msg = {
                 "role": "assistant",
@@ -702,8 +727,6 @@ class ChatController:
         self.window._chat_display.setTextCursor(cursor)
         self.window._chat_display.append(
             "<b style='color: #a6e3a1;'>Assistant</b><br>"
-            "<i style='color: #f38ba8;'>"
-            "Could not compress history. Please start a new conversation."
-            "</i>"
+            f"<i style='color: #f38ba8;'>{CHAT_COMPRESSION_FAILED}</i>"
         )
         self.window._send_btn.setEnabled(True)

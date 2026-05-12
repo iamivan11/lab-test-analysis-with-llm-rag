@@ -47,7 +47,7 @@ QTextEdit:focus, QLineEdit:focus {
     border: 1px solid #89b4fa;
 }
 
-QLabel#profileSectionLabel {
+QLabel#blockHeader {
     color: #89b4fa;
     font-size: 16px;
     font-weight: bold;
@@ -61,35 +61,6 @@ QScrollArea#profileScrollArea {
 
 QScrollArea#profileScrollArea > QWidget,
 QWidget#profileScrollContent {
-    background: transparent;
-}
-
-QScrollArea#profileScrollArea QScrollBar:vertical {
-    background: transparent;
-    border: none;
-    width: 8px;
-    margin: 0px;
-}
-
-QScrollArea#profileScrollArea QScrollBar::handle:vertical {
-    background: #45475a;
-    border-radius: 4px;
-    min-height: 32px;
-}
-
-QScrollArea#profileScrollArea QScrollBar::handle:vertical:hover {
-    background: #585b70;
-}
-
-QScrollArea#profileScrollArea QScrollBar::add-line:vertical,
-QScrollArea#profileScrollArea QScrollBar::sub-line:vertical {
-    height: 0px;
-    background: transparent;
-    border: none;
-}
-
-QScrollArea#profileScrollArea QScrollBar::add-page:vertical,
-QScrollArea#profileScrollArea QScrollBar::sub-page:vertical {
     background: transparent;
 }
 
@@ -261,17 +232,15 @@ QWidget#sidebar {
 }
 
 QWidget#trendsContent,
-QScrollArea#trendsScrollArea,
-QScrollArea#trendsScrollArea > QWidget,
 QWidget#trendsChartsHost {
     background-color: #1e1e2e;
 }
 
-QScrollArea#sidebarTilesScroll,
-QScrollArea#sidebarTilesScroll > QWidget,
-QScrollArea#sidebarTilesScroll > QWidget > QWidget {
-    background-color: transparent;
-}
+/* Don't put QSS on QScrollArea#sidebarTilesScroll or
+   QScrollArea#trendsScrollArea — any stylesheet match on a QScrollArea
+   forces Qt onto QStyleSheetStyle for its scrollbar children, which
+   replaces the native macOS NSScroller with a Fusion-style fallback.
+   Their viewport backgrounds are set via QPalette in Python instead. */
 
 QPushButton#sidebarTile {
     border: 1px solid #313244;
@@ -300,33 +269,6 @@ QListWidget {
     color: #cdd6f4;
     font-size: 13px;
     outline: none;
-}
-
-/* Slim, themed scrollbar for the chat list. Visibility is controlled in
-   Python (auto-hide after a brief idle window) — these rules only style
-   it when visible. */
-QListWidget#chatList QScrollBar:vertical {
-    background: transparent;
-    border: none;
-    width: 8px;
-    margin: 0px;
-}
-QListWidget#chatList QScrollBar::handle:vertical {
-    background: #45475a;
-    border-radius: 4px;
-    min-height: 24px;
-}
-QListWidget#chatList QScrollBar::handle:vertical:hover {
-    background: #585b70;
-}
-QListWidget#chatList QScrollBar::add-line:vertical,
-QListWidget#chatList QScrollBar::sub-line:vertical {
-    height: 0px;
-    background: transparent;
-}
-QListWidget#chatList QScrollBar::add-page:vertical,
-QListWidget#chatList QScrollBar::sub-page:vertical {
-    background: transparent;
 }
 
 QListWidget::item {
