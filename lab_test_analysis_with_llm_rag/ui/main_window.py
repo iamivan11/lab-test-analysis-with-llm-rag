@@ -171,8 +171,7 @@ class MainWindow(QMainWindow):
         self._wire_screens()
         self._init_chat()
 
-        # DEV: force onboarding on every launch.
-        if False and is_onboarding_complete():
+        if is_onboarding_complete():
             self._stack.setCurrentWidget(self._home_screen)
             self._try_load_saved_model()
         else:
