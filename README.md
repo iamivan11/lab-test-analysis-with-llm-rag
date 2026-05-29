@@ -17,11 +17,6 @@ profile data, logs, and generated reports are stored locally under macOS Applica
 - Reindexing: rebuilds the vector DB from already parsed/filtered outputs without reparsing files.
 - macOS packaging: builds `.app` and `.dmg` artifacts.
 
-## Evaluation Dataset
-
-The open synthetic dataset used for evaluation (30 reports across 6 panels and 5 timepoints, with ground-truth biomarker values and chat Q&A pairs) is available at:
-https://drive.google.com/drive/folders/1mQY7hP6vl4UkyA5q8l4BlnCi0QMSXxhn?usp=sharing
-
 ## Tech Stack
 
 - Python 3.12
@@ -34,19 +29,6 @@ https://drive.google.com/drive/folders/1mQY7hP6vl4UkyA5q8l4BlnCi0QMSXxhn?usp=sha
 - pydantic for typed settings/config validation
 - PyInstaller for macOS app packaging
 - uv for dependency and environment management
-
-## Current RAG Setup
-
-- Embedding model: `jinaai/jina-embeddings-v5-text-small`
-- Chunk size: `500`
-- Chunk overlap: `100`
-- Retrieval count: `top_k = 15`
-- Stored metadata per chunk:
-  - `source`
-  - `report_date`
-  - `report_type`
-  - `chunk_index`
-- Retrieved chunks are compressed before final answer generation.
 
 ## Project Structure
 
@@ -109,6 +91,19 @@ tests/                     # automated tests
 report/                    # thesis/report sources
 tmp/                       # local dev/debug outputs, ignored by git
 ```
+
+## Current RAG Setup
+
+- Embedding model: `jinaai/jina-embeddings-v5-text-small`
+- Chunk size: `500`
+- Chunk overlap: `100`
+- Retrieval count: `top_k = 15`
+- Stored metadata per chunk:
+  - `source`
+  - `report_date`
+  - `report_type`
+  - `chunk_index`
+- Retrieved chunks are compressed before final answer generation.
 
 ## Local Data
 
@@ -174,4 +169,9 @@ xattr -dr com.apple.quarantine "/Applications/Lab Analyzer.app"
 ```
 
 Then open the app normally.
+
+## Evaluation Dataset
+
+The open synthetic dataset used for evaluation (30 reports across 6 panels and 5 timepoints, with ground-truth biomarker values and chat Q&A pairs) is available at:
+https://drive.google.com/drive/folders/1mQY7hP6vl4UkyA5q8l4BlnCi0QMSXxhn?usp=sharing
 
