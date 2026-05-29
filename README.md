@@ -1,6 +1,6 @@
 # Lab Analyzer
 
-Local macOS desktop app for analyzing medical lab reports with a local LLM and RAG pipeline.
+macOS desktop app for analyzing medical lab reports with a local LLM and RAG pipeline.
 
 The app is built for private, on-device processing: documents, parsed results, vector index,
 profile data, logs, and generated reports are stored locally under macOS Application Support.
@@ -16,6 +16,11 @@ profile data, logs, and generated reports are stored locally under macOS Applica
 - Health report: generates a concise medical summary report from parsed documents.
 - Reindexing: rebuilds the vector DB from already parsed/filtered outputs without reparsing files.
 - macOS packaging: builds `.app` and `.dmg` artifacts.
+
+## Evaluation Dataset
+
+The open synthetic dataset used for evaluation (30 reports across 6 panels and 5 timepoints, with ground-truth biomarker values and chat Q&A pairs) is available at:
+https://drive.google.com/drive/folders/1mQY7hP6vl4UkyA5q8l4BlnCi0QMSXxhn?usp=sharing
 
 ## Tech Stack
 
@@ -146,42 +151,19 @@ Alternative direct run:
 
 ## Tests
 
-Run all tests:
-
 ```bash
 ./.venv/bin/python -m pytest
 ```
 
-Run focused smoke/config tests:
-
-```bash
-./.venv/bin/python -m pytest tests/test_config.py tests/test_ui_smoke.py -q
-```
-
 ## Build macOS App
-
-Build `.app` and `.dmg`:
 
 ```bash
 packaging/build_macos.sh
 ```
 
-Output:
+Output: `dist/Lab Analyzer.dmg`.
 
-```text
-dist/Lab Analyzer.dmg
-```
-
-The build script:
-
-- runs PyInstaller using `packaging/lab_analyzer.spec`;
-- includes UI icons from `assets/icons/` and the macOS bundle icon from `assets/app_icon/logo.icns`;
-- includes `bin/llama-server` and required dylibs;
-- verifies code signing;
-- creates a compressed DMG with an Applications shortcut;
-- removes the intermediate `.app` and staging directory so only the DMG remains in `dist/`.
-
-Current limitation: the DMG is not notarized, so macOS Gatekeeper may warn external users.
+The DMG is not notarized, so macOS Gatekeeper may warn external users.
 
 ### macOS refuses to open the app ("damaged" / "cannot be opened")
 
@@ -193,30 +175,3 @@ xattr -dr com.apple.quarantine "/Applications/Lab Analyzer.app"
 
 Then open the app normally.
 
-## Model Notes
-
-Supported downloadable models are defined in `config/models.py` under `APPROVED_MODELS`.
-The default system model is selected by `SYSTEM_MODEL_ID`.
-
-Large GGUF model files are stored in Application Support and are not committed to the repo.
-
-## Security Notes
-
-- The app is designed for local processing.
-- User data is stored locally in Application Support.
-- Sensitive runtime directories are created with private permissions where possible.
-- Final production distribution should add notarization and a stricter review of logs/debug outputs.
-
-## Packaging Sanity Checks
-
-After building, verify that no personal data was bundled:
-
-```bash
-find "dist/Lab Analyzer.app/Contents" -type d \
-  \( -name parsing_output -o -name filtering_output -o -name tmp -o -name eval -o -name report \)
-
-find "dist/Lab Analyzer.app/Contents" -type f \
-  \( -name "profile.json" -o -name "settings.json" -o -name "app.log" -o -name "bt_*.md" -o -name "s_*.md" -o -name "ts_*.md" \)
-```
-
-Both commands should return no project/user medical files.
